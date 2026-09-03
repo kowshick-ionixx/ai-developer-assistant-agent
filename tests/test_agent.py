@@ -199,9 +199,7 @@ def test_ask_agent_answers_what_is_langchain_directly():
 def test_ask_agent_answers_explain_subprocess_directly():
     messages = [
         HumanMessage(content="Explain subprocess in Python"),
-        AIMessage(
-            content="The subprocess module lets you spawn new processes."
-        ),
+        AIMessage(content="The subprocess module lets you spawn new processes."),
     ]
 
     result = ask_agent(_FakeAgent(messages), messages)
