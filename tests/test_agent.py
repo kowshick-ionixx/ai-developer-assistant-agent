@@ -156,6 +156,71 @@ def test_system_prompt_mentions_phase_4_tools_and_untrusted_web_content():
     )
 
 
+# ---------------------------------------------------------------------------
+# General software-development questions must be in scope (not just actions
+# like "generate"/"debug"/"review" applied to code the user provides).
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_allows_general_conceptual_questions():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "what is python?" in prompt_lower
+    assert "what is langchain?" in prompt_lower
+    assert "general/conceptual questions" in prompt_lower
+
+
+def test_ask_agent_answers_general_python_question_directly():
+    messages = [
+        HumanMessage(content="What is Python?"),
+        AIMessage(content="Python is a high-level programming language."),
+    ]
+
+    result = ask_agent(_FakeAgent(messages), messages)
+
+    assert result["answer"] == "Python is a high-level programming language."
+    assert result["answer"] != SCOPE_REFUSAL_MESSAGE
+    assert result["tool_calls"] == []
+
+
+def test_ask_agent_answers_what_is_langchain_directly():
+    messages = [
+        HumanMessage(content="What is LangChain?"),
+        AIMessage(
+            content="LangChain is a framework for building LLM-powered applications."
+        ),
+    ]
+
+    result = ask_agent(_FakeAgent(messages), messages)
+
+    assert result["answer"] != SCOPE_REFUSAL_MESSAGE
+    assert result["tool_calls"] == []
+
+
+def test_ask_agent_answers_explain_subprocess_directly():
+    messages = [
+        HumanMessage(content="Explain subprocess in Python"),
+        AIMessage(
+            content="The subprocess module lets you spawn new processes."
+        ),
+    ]
+
+    result = ask_agent(_FakeAgent(messages), messages)
+
+    assert result["answer"] != SCOPE_REFUSAL_MESSAGE
+    assert result["tool_calls"] == []
+
+
+def test_ask_agent_still_refuses_unrelated_question():
+    messages = [
+        HumanMessage(content="Where is Japan?"),
+        AIMessage(content=SCOPE_REFUSAL_MESSAGE),
+    ]
+
+    result = ask_agent(_FakeAgent(messages), messages)
+
+    assert result["answer"] == SCOPE_REFUSAL_MESSAGE
+
+
 def test_ask_agent_extracts_git_diff_tool_call():
     diff_output = "diff --git a/agent.py b/agent.py\n+added line\n"
     ai_call = AIMessage(
