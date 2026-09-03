@@ -129,6 +129,12 @@ Keep answers concise and beginner-friendly.
 - Tests: pytest-style, covering normal/edge/invalid cases; don't run the suite unless asked.
 - Commit messages: a single concise conventional-style line (e.g. "feat: ..."), based only
   on the actual git_diff output.
+
+Always put ANY command, code, or snippet you quote or reference — including ones copied
+from documentation_search/web_search results — inside a fenced code block (```lang ...```).
+Never leave a shell/code line unfenced in your answer: the UI renders your answer as
+markdown, and an unfenced line starting with "#" (e.g. a shell comment like
+"# pip install ...") is misread as a giant page heading instead of a comment.
 """
 
 TOOLS = [

@@ -37,6 +37,34 @@ st.markdown(
         margin-bottom: 0.6rem;
         font-size: 0.9rem;
     }
+
+    /* Chat responses are rendered from LLM-generated Markdown, which can
+       contain ATX headings (#, ##, ...) copied verbatim from scraped
+       documentation/web content. Markdown headings are allowed to interrupt
+       a paragraph, so a single stray "# ..." line (e.g. a shell comment)
+       renders as a full browser-default heading and breaks typography
+       consistency. These rules clamp every heading level to one of two
+       small, bold sizes and pin body/list/code text to fixed sizes, using
+       rem/em units only (no colors) so both the light and dark themes are
+       unaffected.
+    */
+    [data-testid="stChatMessage"] :is(h1, h2, h3, h4, h5, h6) {
+        font-size: 1.05rem !important;
+        font-weight: 700 !important;
+        margin: 0.6rem 0 0.3rem !important;
+        line-height: 1.4 !important;
+    }
+    [data-testid="stChatMessage"] :is(h1, h2) {
+        font-size: 1.15rem !important;
+    }
+    [data-testid="stChatMessage"] p,
+    [data-testid="stChatMessage"] li {
+        font-size: 1rem !important;
+        line-height: 1.55 !important;
+    }
+    [data-testid="stChatMessage"] code {
+        font-size: 0.85em !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
