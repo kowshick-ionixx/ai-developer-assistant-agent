@@ -66,6 +66,19 @@ st.markdown(
     [data-testid="stChatMessage"] code {
         font-size: 0.85em !important;
     }
+
+    /* Defensive guard: force full brightness on the main content area
+       regardless of Streamlit's internal script-run state or any external
+       interference (e.g. a browser extension), so the page can never be
+       left dimmed - during processing or after a response completes. */
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    .block-container,
+    [data-testid="stChatMessage"] {
+        opacity: 1 !important;
+        filter: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
