@@ -9,6 +9,7 @@ lives in agent.py, and the tools live in tools.py.
 """
 
 import html
+import re
 
 import streamlit as st
 
@@ -122,6 +123,42 @@ def _output_block(text: str, limit: int = 2000) -> str:
     if len(text) > limit:
         text = text[:limit] + "\n... (truncated)"
     return f'<pre style="white-space:pre-wrap;margin:0;">{html.escape(text)}</pre>'
+
+
+# Matches a *complete* ```lang\n...\n``` fenced code block. Only fully
+# paired fences are matched - a stray/unclosed ``` is left as plain text
+# instead of being treated as an (empty) code block, which is what was
+# producing the large empty dark boxes: Markdown's own fence auto-detection
+# has no way to tell "malformed fence" from "intentional empty code block".
+_CODE_FENCE_RE = re.compile(r"```([a-zA-Z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
+def render_answer(text: str) -> None:
+    """Render assistant answer text, drawing fenced code blocks with
+    st.code() (guaranteed monospace font + syntax highlighting) instead of
+    relying on Markdown's automatic fence detection, and skipping any code
+    fence or text segment that has no actual content.
+    """
+    text = text or ""
+    pos = 0
+    rendered_anything = False
+    for match in _CODE_FENCE_RE.finditer(text):
+        before = text[pos : match.start()]
+        if before.strip():
+            st.markdown(before)
+            rendered_anything = True
+        language = match.group(1).strip() or None
+        code = match.group(2).strip("\n")
+        if code.strip():
+            st.code(code, language=language)
+            rendered_anything = True
+        pos = match.end()
+    remainder = text[pos:]
+    if remainder.strip():
+        st.markdown(remainder)
+        rendered_anything = True
+    if not rendered_anything:
+        st.markdown(text)
 
 
 def render_tool_box(tool_call: dict) -> None:
@@ -271,7 +308,10 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         for tool_call in message.get("tool_calls", []):
             render_tool_box(tool_call)
-        st.markdown(message["content"])
+        if message["role"] == "assistant":
+            render_answer(message["content"])
+        else:
+            st.markdown(message["content"])
 
 # ---------------------------------------------------------------------------
 # Handle new input (either typed, or clicked from the sidebar examples)
@@ -313,7 +353,7 @@ if user_input:
         for tool_call in tool_calls:
             render_tool_box(tool_call)
 
-        st.markdown(answer)
+        render_answer(answer)
 
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "tool_calls": tool_calls}
