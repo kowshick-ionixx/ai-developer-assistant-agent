@@ -91,6 +91,8 @@ EXAMPLE_QUESTIONS = [
     "Write a Python function to check whether a number is prime.",
     "Review this code:\n\ndef add_numbers(a,b):\n return a+b",
     "Run the tests.",
+    "Run my tests and explain why any tests are failing.",
+    "Check my project for syntax errors.",
     "What is this project?",
     "What files have changed in my project?",
     "Create a commit message from my current changes.",
@@ -103,6 +105,7 @@ TOOL_DISPLAY_NAMES = {
     "run_pytest": "🔧 Running Pytest",
     "run_ruff": "🔧 Running Ruff",
     "run_black": "🔧 Running Black",
+    "check_python_syntax": "🔧 Checking Python Syntax",
     "list_project_files": "🔧 Listing Project Files",
     "read_project_file": "🔧 Reading Project File",
     "search_project": "🔧 Searching Project",
@@ -229,6 +232,8 @@ with st.sidebar:
         "✓ Pytest\n\n"
         "✓ Ruff\n\n"
         "✓ Black\n\n"
+        "✓ Syntax Checking\n\n"
+        "✓ Test Failure & Traceback Analysis\n\n"
         "✓ Project Awareness\n\n"
         "✓ Web & Documentation Search\n\n"
         "✓ Git Tools (read-only)\n\n"

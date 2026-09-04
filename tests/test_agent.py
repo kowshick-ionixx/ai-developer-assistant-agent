@@ -157,6 +157,52 @@ def test_system_prompt_mentions_phase_4_tools_and_untrusted_web_content():
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 tool wiring and execution/error-analysis guidance
+# ---------------------------------------------------------------------------
+
+
+def test_check_python_syntax_tool_is_registered():
+    tool_names = {t.name for t in TOOLS}
+    assert "check_python_syntax" in tool_names
+
+
+def test_system_prompt_mentions_check_python_syntax():
+    assert "check_python_syntax" in SYSTEM_PROMPT
+
+
+def test_system_prompt_covers_traceback_and_failure_analysis():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "traceback" in prompt_lower
+    assert "failing test" in prompt_lower or "failure analysis" in prompt_lower
+    assert "never invent a file or line number" in prompt_lower
+
+
+def test_system_prompt_requires_rerun_before_claiming_fixed():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "is fixed" in prompt_lower or "is resolved" in prompt_lower
+    assert "rerun" in prompt_lower or "rerun run_pytest" in prompt_lower
+
+
+def test_system_prompt_covers_regression_testing():
+    assert "regression" in SYSTEM_PROMPT.lower()
+
+
+def test_system_prompt_rejects_arbitrary_command_execution():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "powershell" in prompt_lower
+    assert "no tool for running" in prompt_lower
+    assert "arbitrary" in prompt_lower
+
+
+def test_system_prompt_never_reveals_env_var_values():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "google_api_key" in prompt_lower
+    assert "tavily_api_key" in prompt_lower
+    assert "github_token" in prompt_lower
+    assert "never state or guess their values" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
 # General software-development questions must be in scope (not just actions
 # like "generate"/"debug"/"review" applied to code the user provides).
 # ---------------------------------------------------------------------------

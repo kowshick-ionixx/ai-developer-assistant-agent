@@ -6,24 +6,25 @@ when it decides it needs help with something the language model can't (or
 shouldn't) do on its own, like exact arithmetic or running an external
 command-line program.
 
-This file defines seventeen tools:
+This file defines eighteen tools:
     1. calculator             -> evaluates a math expression safely
     2. explain_python_code    -> analyzes Python code structure (never runs it)
     3. run_pytest              -> runs this project's own test suite
     4. run_ruff                -> lints Python code/files with Ruff
     5. run_black               -> checks/formats Python code/files with Black
-    6. list_project_files     -> shows this project's real file/folder structure
-    7. read_project_file      -> reads a real source file from this project
-    8. search_project         -> searches this project's real source files
-    9. web_search              -> searches the web via Tavily
-    10. documentation_search  -> searches for official technical documentation
-    11. git_status            -> shows the local Git working tree status
-    12. git_log               -> shows recent Git commits
-    13. git_diff              -> shows a diff of uncommitted changes
-    14. git_branch            -> shows the current/local Git branches
-    15. github_get_repository -> looks up a GitHub repository's info
-    16. github_get_issues     -> lists a GitHub repository's issues
-    17. github_get_pull_requests -> lists a GitHub repository's pull requests
+    6. check_python_syntax    -> parses Python file(s) to find syntax errors (never runs them)
+    7. list_project_files     -> shows this project's real file/folder structure
+    8. read_project_file      -> reads a real source file from this project
+    9. search_project         -> searches this project's real source files
+    10. web_search              -> searches the web via Tavily
+    11. documentation_search  -> searches for official technical documentation
+    12. git_status            -> shows the local Git working tree status
+    13. git_log               -> shows recent Git commits
+    14. git_diff              -> shows a diff of uncommitted changes
+    15. git_branch            -> shows the current/local Git branches
+    16. github_get_repository -> looks up a GitHub repository's info
+    17. github_get_issues     -> lists a GitHub repository's issues
+    18. github_get_pull_requests -> lists a GitHub repository's pull requests
 
 Code generation, debugging, review, and refactoring are handled by Gemini's
 own reasoning (guided by the system prompt in agent.py) rather than by tools
@@ -76,6 +77,21 @@ Safety notes for run_pytest/run_ruff/run_black:
       path elsewhere) is rejected before it touches the filesystem.
     - Pasted `code` for run_ruff/run_black is passed over stdin - it is
       never written to disk.
+    - All three enforce a fixed subprocess timeout (_SUBPROCESS_TIMEOUT_SECONDS
+      for run_pytest, 30s for run_ruff/run_black) so a hung process can never
+      block the agent indefinitely; a timeout is reported as a clear, honest
+      "took too long" error rather than a fabricated success.
+
+Safety notes for check_python_syntax:
+    - Never executes anything - it only parses each target file's source
+      with Python's `ast` module (the same technique explain_python_code
+      uses) to detect real SyntaxErrors.
+    - Uses the same path-safety, exclusion, and blocked-file checks as
+      read_project_file/run_ruff, so it can never be pointed outside the
+      project or at a credential-like file.
+    - Checking a directory caps how many files are scanned
+      (_MAX_SYNTAX_CHECK_FILES) to avoid flooding the model's context on a
+      very large project.
 
 Safety notes for list_project_files/read_project_file/search_project:
     - These are read-only: they never write, execute, or delete anything.
@@ -658,7 +674,111 @@ def run_black(code: str = "", file_path: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 6: Project file/folder structure
+# Tool 6: Python syntax checker
+# ---------------------------------------------------------------------------
+
+_MAX_SYNTAX_CHECK_FILES = 200
+
+
+def _iter_checkable_python_files(root: Path) -> list[Path]:
+    """Collect every checkable ".py" file under `root`, skipping noise
+    folders and credential-like files, up to _MAX_SYNTAX_CHECK_FILES."""
+    files: list[Path] = []
+    for path in sorted(root.rglob("*.py")):
+        if not path.is_file():
+            continue
+        if _is_excluded_path(path) or _is_blocked_file(path):
+            continue
+        files.append(path)
+        if len(files) >= _MAX_SYNTAX_CHECK_FILES:
+            break
+    return files
+
+
+@tool
+def check_python_syntax(file_path: str = ".") -> str:
+    """Check Python file(s) in this project for syntax errors, without executing any code.
+
+    Pass a specific file path (e.g. "tools.py") to check one file, a
+    subdirectory to check every ".py" file under it, or "." (the default) to
+    check the entire project. Each file is only parsed with Python's `ast`
+    module - it is never executed. Use this whenever the user asks to check
+    for syntax errors, validate that Python files parse correctly, or
+    confirm a file has no syntax problems. Reports only real errors found by
+    parsing the actual file(s) - never invents an error or a location.
+    """
+    log_tool_call("check_python_syntax")
+    file_path = (file_path or ".").strip() or "."
+    log_tool_input(file_path)
+
+    safe_path = _resolve_safe_path(file_path)
+    if safe_path is None:
+        result = f"Error: '{file_path}' is outside the project directory and cannot be checked."
+        log_tool_result(result)
+        return result
+
+    if _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+        result = f"Error: '{file_path}' cannot be checked for security reasons."
+        log_tool_result(result)
+        return result
+
+    if not safe_path.exists():
+        result = f"Error: '{file_path}' was not found in the project."
+        log_tool_result(result)
+        return result
+
+    log_tool_execution("Parsing Python file(s) for syntax errors...")
+
+    if safe_path.is_dir():
+        targets = _iter_checkable_python_files(safe_path)
+    else:
+        if safe_path.suffix.lower() != ".py":
+            result = f"Error: '{file_path}' is not a Python file."
+            log_tool_result(result)
+            return result
+        targets = [safe_path]
+
+    if not targets:
+        result = f"No Python files found to check in '{file_path}'."
+        log_tool_result(result)
+        return result
+
+    errors: list[str] = []
+    checked = 0
+    for target in targets:
+        checked += 1
+        try:
+            source = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            rel = target.relative_to(PROJECT_ROOT).as_posix()
+            errors.append(f"{rel}: could not read file ({exc})")
+            continue
+        try:
+            ast.parse(source, filename=str(target))
+        except SyntaxError as exc:
+            rel = target.relative_to(PROJECT_ROOT).as_posix()
+            location = f"{rel}:{exc.lineno}" if exc.lineno else rel
+            bad_line = (exc.text or "").rstrip()
+            detail = f"{location}: {exc.msg}"
+            if bad_line:
+                detail += f"\n    {bad_line}"
+            errors.append(detail)
+
+    if not errors:
+        result = f"Checked {checked} Python file(s) in '{file_path}' - no syntax errors found."
+        log_tool_result(result)
+        return result
+
+    result = (
+        f"Checked {checked} Python file(s) in '{file_path}' - "
+        f"found {len(errors)} syntax error(s):\n\n" + "\n\n".join(errors)
+    )
+    log_tool_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: Project file/folder structure
 # ---------------------------------------------------------------------------
 
 
@@ -703,7 +823,7 @@ def list_project_files() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 7: Project file reader
+# Tool 8: Project file reader
 # ---------------------------------------------------------------------------
 
 
@@ -781,7 +901,7 @@ def read_project_file(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 8: Project search
+# Tool 9: Project search
 # ---------------------------------------------------------------------------
 
 
@@ -895,7 +1015,7 @@ def _format_search_results(results: list[dict], query: str, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 9: Web search
+# Tool 10: Web search
 # ---------------------------------------------------------------------------
 
 
@@ -931,7 +1051,7 @@ def web_search(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 10: Documentation search
+# Tool 11: Documentation search
 # ---------------------------------------------------------------------------
 
 
@@ -1018,7 +1138,7 @@ def _redact_diff_for_blocked_files(diff_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 11: git status
+# Tool 12: git status
 # ---------------------------------------------------------------------------
 
 
@@ -1082,7 +1202,7 @@ def git_status() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 12: git log
+# Tool 13: git log
 # ---------------------------------------------------------------------------
 
 
@@ -1133,7 +1253,7 @@ def git_log(max_count: int = _DEFAULT_GIT_LOG_COMMITS) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 13: git diff
+# Tool 14: git diff
 # ---------------------------------------------------------------------------
 
 
@@ -1198,7 +1318,7 @@ def git_diff(file_path: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 14: git branch
+# Tool 15: git branch
 # ---------------------------------------------------------------------------
 
 
@@ -1264,7 +1384,7 @@ def _github_error_message(exc: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 15: github_get_repository
+# Tool 16: github_get_repository
 # ---------------------------------------------------------------------------
 
 
@@ -1305,7 +1425,7 @@ def github_get_repository(repo_full_name: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 16: github_get_issues
+# Tool 17: github_get_issues
 # ---------------------------------------------------------------------------
 
 
@@ -1366,7 +1486,7 @@ def github_get_issues(repo_full_name: str = "", state: str = "open") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 17: github_get_pull_requests
+# Tool 18: github_get_pull_requests
 # ---------------------------------------------------------------------------
 
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-A beginner-friendly AI agent built with **Python**, **LangChain**, **Google Gemini**, and **Streamlit** that behaves like a junior software developer. It answers programming questions, does math, explains code, and — as of Phase 2 — generates, debugs, reviews, refactors, and tests code, and can run Pytest/Ruff/Black on request. It decides for itself, on every message, whether it needs a tool or can just answer directly. It is also **project-aware**: it can inspect this project's own real structure, files, and source code (via `list_project_files`/`read_project_file`/`search_project`) to answer questions about itself accurately, instead of guessing. As of Phase 4, it can also reach outside the project: **web/documentation search** (via Tavily) for current framework/API information, **read-only Git inspection**, **read-only GitHub repository/issue/PR lookups**, and **commit-message and documentation generation** grounded in the project's real diff/files.
+A beginner-friendly AI agent built with **Python**, **LangChain**, **Google Gemini**, and **Streamlit** that behaves like a junior software developer. It answers programming questions, does math, explains code, and — as of Phase 2 — generates, debugs, reviews, refactors, and tests code, and can run Pytest/Ruff/Black on request. It decides for itself, on every message, whether it needs a tool or can just answer directly. It is also **project-aware**: it can inspect this project's own real structure, files, and source code (via `list_project_files`/`read_project_file`/`search_project`) to answer questions about itself accurately, instead of guessing. As of Phase 4, it can also reach outside the project: **web/documentation search** (via Tavily) for current framework/API information, **read-only Git inspection**, **read-only GitHub repository/issue/PR lookups**, and **commit-message and documentation generation** grounded in the project's real diff/files. As of Phase 5, it can also check Python files for syntax errors (`check_python_syntax`), analyze real pytest failures and tracebacks by combining `run_pytest`'s actual output with `read_project_file`/`search_project`, and verify a fix by rerunning the suite — always reporting real results, never fabricated ones.
 
 This project exists to teach one thing clearly: **how an AI agent actually works**.
 
@@ -39,7 +39,15 @@ This project exists to teach one thing clearly: **how an AI agent actually works
 - 📄 Documentation generation — inspects real project files (`read_project_file`/`search_project`) and writes documentation as its answer
 - 🧩 Combined reasoning — compares this project's real code against current official documentation and labels which parts of the answer come from each
 
-**Both phases**
+**Phase 5**
+- ✅ Controlled test execution — `run_pytest` reports the real exit code plus captured stdout/stderr, bounded by a subprocess timeout
+- 🩺 Syntax checking (`check_python_syntax`) — parses (never executes) one file, a folder, or the whole project to find real `SyntaxError`s
+- 🧵 Traceback analysis — explains Problem / Cause / Location / Suggested fix using only the file and line actually present in a traceback
+- 🧪 Test failure analysis — combines `run_pytest`'s real output with `read_project_file`/`search_project` to explain why a specific test actually failed
+- 🔁 Fix-and-verify workflow — since there is no file-editing tool, the assistant explains the needed code change and only claims an issue "is fixed" after rerunning `run_pytest` and seeing the real result
+- 📊 Regression checking — reruns the full suite after a fix and reports actual before/after pass/fail counts
+
+**All phases**
 - 🔧 Visible tool calling, so you can see exactly when and why a tool ran
 - 🎯 Optional Quick Action mode selector (Ask / Generate / Debug / Review / Refactor / Test)
 - 💬 Chat history for the current session
@@ -58,7 +66,7 @@ GOOGLE GEMINI
   ↓
 TOOL DECISION
   ↓
-TOOLS (calculator / code explainer / pytest / ruff / black /
+TOOLS (calculator / code explainer / pytest / ruff / black / check_python_syntax /
        list_project_files / read_project_file / search_project /
        web_search / documentation_search /
        git_status / git_log / git_diff / git_branch /
@@ -163,7 +171,9 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 22. `Show me the open issues for octocat/hello-world.` — `github_get_issues`
 23. `Show me the open pull requests for octocat/hello-world.` — `github_get_pull_requests`
 24. `Generate documentation for tools.py.` — reads the real file, then writes documentation as its answer
-25. `Where is Japan?` — out-of-scope, returns the exact scope-refusal message
+25. `Check my project for syntax errors.` — `check_python_syntax`
+26. `Run my tests and explain why any tests are failing.` — `run_pytest`, then reads the failing test/source to explain the real cause
+27. `Where is Japan?` — out-of-scope, returns the exact scope-refusal message
 
 ## How the Agent Works
 
@@ -181,13 +191,14 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 ## Important Files
 
 - **`app.py`** — the Streamlit UI only. Renders the sidebar (features, Quick Actions, example questions), chat history, input box, and tool-call boxes. Calls into `agent.py` for anything AI-related; contains no LLM or tool logic itself.
-- **`agent.py`** — the agent itself. Loads the API key, configures the Gemini model, defines the system prompt (including the Phase 2 response-format and Phase 4 external-knowledge/Git/GitHub instructions), and builds the LangChain agent (`create_agent`) with all seventeen tools attached.
-- **`tools.py`** — the seventeen tools, each a plain Python function wrapped in LangChain's `@tool` decorator:
+- **`agent.py`** — the agent itself. Loads the API key, configures the Gemini model, defines the system prompt (including the Phase 2 response-format, Phase 4 external-knowledge/Git/GitHub instructions, and Phase 5 execution/error-analysis/security instructions), and builds the LangChain agent (`create_agent`) with all eighteen tools attached.
+- **`tools.py`** — the eighteen tools, each a plain Python function wrapped in LangChain's `@tool` decorator:
   - `calculator` — parses the expression with Python's `ast` module and evaluates it node-by-node against an allow-list of operators. Never calls `eval()`.
   - `explain_python_code` — parses code with `ast` to list its structure **without running it**.
   - `run_pytest` — runs this project's own fixed `tests/` suite via `python -m pytest` and reports the exit code and output.
   - `run_ruff` — lints either pasted code (via stdin, nothing written to disk) or a project file (path validated against directory traversal).
   - `run_black` — formats pasted code (via stdin) or checks formatting of a project file and shows the diff **without ever overwriting it**.
+  - `check_python_syntax` — parses one file, a folder, or the whole project with `ast` to report real `SyntaxError`s, **without ever executing anything**.
   - `list_project_files` — returns this project's real file/folder structure as an indented tree, excluding noise folders (`venv`, `.git`, caches).
   - `read_project_file` — reads the real contents of a project source file (read-only), rejecting paths outside the project, `.env`, other credential-like files, binary files, and files over 1 MB.
   - `search_project` — searches this project's real source files for a function/class/variable/import/text and returns matching file paths and line numbers.
@@ -213,6 +224,7 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 | Project structure | `list_project_files` tool — real file/folder tree, noise folders excluded |
 | Reading project files | `read_project_file` tool — real file contents, sandboxed to the project root |
 | Searching the project | `search_project` tool — real file/line matches for a function/class/text query |
+| Syntax checking | `check_python_syntax` tool — parses (never executes) file(s) to find real syntax errors |
 
 ## Web Search, Documentation, Git & GitHub (Phase 4)
 
@@ -230,6 +242,18 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 | GitHub pull requests | `github_get_pull_requests` tool — up to 10 real pull requests |
 | Commit message generation | Gemini reasoning over the real `git_diff` output — never runs `git commit` |
 | Documentation generation | Gemini reasoning over real `read_project_file`/`search_project` output — produces text only, never writes files |
+
+## Code Execution, Testing & Error Analysis (Phase 5)
+
+| Capability | How it's implemented |
+|---|---|
+| Controlled test execution | `run_pytest` tool — real exit code + captured stdout/stderr, bounded by `_SUBPROCESS_TIMEOUT_SECONDS` |
+| Syntax checking | `check_python_syntax` tool — parses file(s) with `ast`, never executes them |
+| Traceback analysis | Gemini reasoning over the actual traceback text — Problem / Cause / Location / Suggested fix, never inventing a file or line not present in it |
+| Test failure analysis | Gemini reasoning over `run_pytest`'s real output plus `read_project_file`/`search_project` on the failing test and the source it exercises |
+| Fix-and-verify workflow | Gemini explains the needed code change (no file-editing tool exists); only reruns `run_pytest` and only claims "fixed" after the real rerun confirms it |
+| Regression testing | Rerunning `run_pytest` after a fix and comparing the two real before/after pass/fail counts |
+| Security | No generic command-execution tool exists at all — arbitrary PowerShell/CMD/shell commands, unrestricted Python execution, and destructive/file-modifying requests are refused by the system prompt rather than attempted |
 
 ## Core Concepts
 
@@ -272,6 +296,10 @@ This project uses **LangChain 1.x**, which replaced the older `initialize_agent`
   - Issue/PR counts are capped at 10, and results are only ever the real data PyGithub returned — never invented.
 - Errors are shown to the user as short, friendly messages — full details are only printed to the terminal for debugging.
 - `logger.py`'s secret redaction also recognizes GitHub token formats (`ghp_`/`gho_`/`github_pat_`/etc.) and Tavily key formats (`tvly-`), in addition to the existing Google API key and generic `KEY=`/`TOKEN=`/`SECRET=` patterns.
+- **There is no generic "run a command" tool, and Phase 5 does not add one.** `run_pytest`, `run_ruff`, `run_black`, and `check_python_syntax` remain the only tools that touch the filesystem/an external process, each restricted exactly as described above; `check_python_syntax` only ever calls `ast.parse()` on file contents it already validated with the same path-safety/exclusion/blocked-file checks as `read_project_file` — it never executes anything.
+- Every subprocess-based tool (`run_pytest`/`run_ruff`/`run_black`) enforces a fixed timeout, so a hung process can never block the agent indefinitely; a timeout is always reported honestly ("took too long") instead of as a fabricated success.
+- The system prompt explicitly instructs the assistant to refuse requests for arbitrary PowerShell/CMD/shell commands, unrestricted Python execution, and destructive or file-modifying operations (e.g. "delete all files"), explaining that no such tool exists rather than attempting the request another way. It may name environment variables (`GOOGLE_API_KEY`, `TAVILY_API_KEY`, `GITHUB_TOKEN`) but is instructed to never state or guess their values.
+- Since no file-editing tool exists, the assistant can explain a fix for a failing test but cannot apply it — it only reruns `run_pytest` (and only claims an issue is fixed) after that real rerun confirms it.
 
 ## Testing
 
@@ -283,16 +311,17 @@ python -m pytest tests -v
 
 Or ask the assistant directly in the chat: *"Run the tests."*
 
-Tests mock the LangChain agent object where relevant (`ask_agent`'s tool-call extraction) so the suite never depends on a live Gemini API call or a configured API key. `run_pytest`/`run_ruff`/`run_black` are tested against the real installed executables since they're safe, read-only/stdin-only operations. The Phase 4 tools are tested the same way `ask_agent` is — by mocking at the external-service boundary (`tools.TavilyClient`, `tools._get_repo`, `tools._get_github_client`) so the suite never makes a real network call, never needs a real `TAVILY_API_KEY`/`GITHUB_TOKEN`, and never needs a real `git` executable installed.
+Tests mock the LangChain agent object where relevant (`ask_agent`'s tool-call extraction) so the suite never depends on a live Gemini API call or a configured API key. `run_ruff`/`run_black`/`check_python_syntax` are tested against real inputs since they're safe, read-only/stdin-only/parse-only operations. `run_pytest` (`tests/test_execution_tools.py`) is tested by mocking `subprocess.run` instead of actually invoking it, since a real call would recursively re-run this whole suite as a subprocess — the mock still verifies real stdout/stderr capture, exit-code handling, the configured timeout, and error handling (missing executable, missing `tests/` folder). The Phase 4 tools are tested the same way `ask_agent` is — by mocking at the external-service boundary (`tools.TavilyClient`, `tools._get_repo`, `tools._get_github_client`) so the suite never makes a real network call, never needs a real `TAVILY_API_KEY`/`GITHUB_TOKEN`, and never needs a real `git` executable installed.
 
-## Version 4 Ideas (not implemented)
+## Version 5 Ideas (not implemented)
 
-These are intentionally left out to keep this project simple and easy to learn from — Phase 4 is about external knowledge and Git/GitHub *assistance*, not autonomous execution:
+These are intentionally left out to keep this project simple and easy to learn from — Phase 5 is about *controlled, verifiable* execution and error analysis, not autonomous software development:
 
+- Sandboxed/unrestricted code execution or a generic "run any command" tool
+- Automatic file editing / autonomous fix application (the assistant explains fixes; it does not apply them)
+- Fully autonomous test/fix/re-run loops that require no human review
 - RAG (retrieval-augmented generation) / vector databases
 - Multi-agent architectures / LangGraph
-- Sandboxed/unrestricted code execution
-- Automatic test/fix/re-run loops
 - Automatic Git operations (commit, push, branch create/delete, reset, clean)
 - Automatic GitHub operations (creating/closing/commenting on issues or PRs, merging)
 - File upload / analysis
