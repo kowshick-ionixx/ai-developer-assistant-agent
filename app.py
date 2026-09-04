@@ -17,11 +17,11 @@ import streamlit.components.v1 as components
 import documents
 import workflow
 from agent import (
-    ask_agent,
     build_agent,
     get_api_key,
     new_ai_message,
     new_human_message,
+    run_agent_turn,
     transcribe_audio,
 )
 from logger import log_error
@@ -716,7 +716,7 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                result = ask_agent(agent, st.session_state.lc_history)
+                result = run_agent_turn(agent, st.session_state.lc_history)
                 answer = result["answer"]
                 tool_calls = result["tool_calls"]
                 workflow_states = result.get("workflow_states", [])

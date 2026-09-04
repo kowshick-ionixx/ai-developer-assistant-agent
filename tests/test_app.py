@@ -2,7 +2,7 @@
 Tests for app.py's document-attachment and voice-input UI wiring.
 
 These drive the real Streamlit script headlessly via streamlit.testing.v1's
-AppTest (no browser, no real Gemini/network calls - agent.ask_agent and
+AppTest (no browser, no real Gemini/network calls - agent.run_agent_turn and
 agent.transcribe_audio are monkeypatched). They exist to protect attachment
 state, clearing attachments, upload rejection, voice-to-text reaching the
 existing chat flow, and that the AI Features sidebar panel is informational
@@ -34,11 +34,11 @@ def _clean_workflow_registry():
 
 @pytest.fixture
 def apptest_with_mocked_agent(monkeypatch):
-    """Run app.py headlessly with ask_agent/transcribe_audio replaced by
+    """Run app.py headlessly with run_agent_turn/transcribe_audio replaced by
     fakes, so no real API key or network call is ever needed."""
     import agent as agent_module
 
-    def fake_ask_agent(agent, history):
+    def fake_run_agent_turn(agent, history):
         last = history[-1]
         text = getattr(last, "content", str(last))
         return {"answer": f"MOCKED REPLY for: {text[:200]}", "tool_calls": []}
@@ -46,7 +46,7 @@ def apptest_with_mocked_agent(monkeypatch):
     def fake_transcribe_audio(audio_bytes, mime_type="audio/wav"):
         return "explain how tools.py works in my project"
 
-    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn)
     monkeypatch.setattr(agent_module, "transcribe_audio", fake_transcribe_audio)
 
     at = AppTest.from_file(_APP_PATH)
@@ -395,14 +395,16 @@ def test_workflow_states_are_displayed_when_present(
 
     import agent as agent_module
 
-    def fake_ask_agent_with_workflow(agent, history):
+    def fake_run_agent_turn_with_workflow(agent, history):
         return {
             "answer": "Done.",
             "tool_calls": [],
             "workflow_states": ["IMPLEMENTING", "WAITING_FOR_APPROVAL"],
         }
 
-    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent_with_workflow)
+    monkeypatch.setattr(
+        agent_module, "run_agent_turn", fake_run_agent_turn_with_workflow
+    )
     at.chat_input[0].set_value("Add a feature").run(timeout=30)
     assert at.exception == []
 

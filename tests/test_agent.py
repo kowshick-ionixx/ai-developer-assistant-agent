@@ -14,16 +14,21 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import agent as agent_module
 from agent import (
+    MAX_AUTO_CONTINUE_STEPS,
     SCOPE_REFUSAL_MESSAGE,
     SYSTEM_PROMPT,
     TOOLS,
+    _derive_workflow_states,
     _extract_text,
+    _pytest_call_passed,
     ask_agent,
     build_agent,
+    classify_request,
     create_plan,
     get_api_key,
     new_ai_message,
     new_human_message,
+    run_agent_turn,
     transcribe_audio,
 )
 
@@ -559,3 +564,424 @@ def test_system_prompt_describes_repair_limit_as_real_not_a_guideline():
     prompt_lower = SYSTEM_PROMPT.lower()
     assert "real, enforced" in prompt_lower or "real limit" in prompt_lower
     assert "not just a guideline" in prompt_lower or "not just a" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: classify_request - dedicated development-task classification
+# ---------------------------------------------------------------------------
+
+
+def test_classify_request_true_for_development_response(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("DEVELOPMENT")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    assert (
+        classify_request("Add a function to check whether a number is prime.") is True
+    )
+
+
+def test_classify_request_false_for_other_response(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("OTHER")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    assert classify_request("What is 5 factorial?") is False
+
+
+def test_classify_request_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(ValueError):
+        classify_request("Add a feature")
+
+
+def test_classify_request_does_not_build_the_full_tool_using_agent(monkeypatch):
+    # classify_request is a single plain completion call (like create_plan) -
+    # it must never itself spin up a second, separate tool-using agent.
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("DEVELOPMENT")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("classify_request must not build a tool-using agent")
+
+    monkeypatch.setattr(agent_module, "create_agent", _fail_if_called)
+
+    classify_request("Add a feature")
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: run_agent_turn - the bounded auto-continuation orchestrator.
+#
+# Regression coverage for the reported bug: a Phase 6 development task would
+# reach INSPECTING/PLANNING and then silently stop, because the underlying
+# model sometimes ends its turn with only a text plan/summary and no tool
+# call, which ends create_agent's tool-calling loop early. run_agent_turn
+# nudges the SAME agent to keep acting instead of just narrating, bounded so
+# it can never loop forever.
+# ---------------------------------------------------------------------------
+
+
+def _tool_call(name: str, output: str = "ok") -> dict:
+    return {"name": name, "input": {}, "output": output}
+
+
+def test_run_agent_turn_passes_non_development_requests_straight_through(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "4",
+            "tool_calls": [_tool_call("calculator", "4")],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: False)
+
+    conversation = [new_human_message("Calculate 2 + 2")]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 1
+    assert result["answer"] == "4"
+
+
+def test_run_agent_turn_stops_once_a_change_is_proposed(monkeypatch):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "Proposed change abc123 for is_prime.py. Please approve.",
+            "tool_calls": [_tool_call("propose_file_change")],
+            "workflow_states": ["PROPOSING_CHANGE"],
+            "pending_change_ids": ["abc123"],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [
+        new_human_message("Add a function to check whether a number is prime.")
+    ]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 1  # stopped immediately - a real approval gate was reached
+    assert result["pending_change_ids"] == ["abc123"]
+    assert "COMPLETED" not in result["workflow_states"]
+
+
+def test_run_agent_turn_nudges_a_stalled_plan_only_response_into_action(monkeypatch):
+    """Regression test for the reported Phase 6 bug: the model announced a
+    plan with zero tool calls and the turn ended there. This must now be
+    nudged into actually proposing the change."""
+    responses = [
+        {
+            "answer": "1. Inspect project\n2. Propose change",
+            "tool_calls": [],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        },
+        {
+            "answer": "Proposed change xyz789. Please approve.",
+            "tool_calls": [_tool_call("propose_file_change")],
+            "workflow_states": ["PROPOSING_CHANGE"],
+            "pending_change_ids": ["xyz789"],
+        },
+    ]
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [
+        new_human_message("Add a function to check whether a number is prime.")
+    ]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 2
+    # The nudge continuation must actually be added to what the agent sees,
+    # not just an identical re-send of the original conversation.
+    assert len(calls[1]) > len(conversation)
+    assert result["pending_change_ids"] == ["xyz789"]
+
+
+def test_run_agent_turn_stops_after_two_consecutive_idle_responses(monkeypatch):
+    """Never loop forever: if nudging produces no tool call twice in a row,
+    give up rather than keep retrying."""
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "I'm not sure what to do next.",
+            "tool_calls": [],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature.")]
+    run_agent_turn(object(), conversation)
+
+    assert len(calls) == 2  # one real attempt + one nudge, then it bails out
+    assert len(calls) < MAX_AUTO_CONTINUE_STEPS
+
+
+def test_run_agent_turn_never_exceeds_max_auto_continue_steps(monkeypatch):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        # Always makes "progress" (a tool call) but never actually finishes,
+        # so only the hard step cap can end the loop.
+        return {
+            "answer": "Still working on it.",
+            "tool_calls": [_tool_call("list_project_files")],
+            "workflow_states": ["INSPECTING"],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature.")]
+    run_agent_turn(object(), conversation)
+
+    assert len(calls) == MAX_AUTO_CONTINUE_STEPS
+
+
+def test_run_agent_turn_stops_when_the_model_asks_a_clarifying_question(monkeypatch):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "Which file should the new function go in?",
+            "tool_calls": [],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature.")]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 1
+    assert result["answer"].endswith("?")
+
+
+def test_run_agent_turn_falls_back_to_ask_agent_when_classification_fails(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "ok",
+            "tool_calls": [],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        }
+
+    def failing_classify(task):
+        raise RuntimeError("API hiccup")
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", failing_classify)
+
+    conversation = [new_human_message("Add a feature.")]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 1  # treated as non-development, passed straight through
+    assert result["answer"] == "ok"
+
+
+def test_run_agent_turn_marks_completed_after_a_passing_final_test_run(monkeypatch):
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "All tests passed.",
+            "tool_calls": [_tool_call("run_pytest", "Exit code: 0\n\n5 passed")],
+            "workflow_states": ["TESTING"],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature and run the tests.")]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(calls) == 1  # a passing final run is a real stopping point
+    assert "REVIEWING" in result["workflow_states"]
+    assert "COMPLETED" in result["workflow_states"]
+    assert "FAILED" not in result["workflow_states"]
+
+
+def test_run_agent_turn_marks_failed_after_a_failing_final_test_run(monkeypatch):
+    def fake_ask_agent(agent, conversation):
+        return {
+            "answer": "Tests are still failing after repeated fixes.",
+            "tool_calls": [
+                _tool_call("run_pytest", "Exit code: 1\n\n1 failed, 4 passed")
+            ],
+            "workflow_states": ["TESTING"],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature and run the tests.")]
+    result = run_agent_turn(object(), conversation)
+
+    assert "REVIEWING" in result["workflow_states"]
+    assert "FAILED" in result["workflow_states"]
+    assert "COMPLETED" not in result["workflow_states"]
+
+
+def test_run_agent_turn_does_not_claim_completed_when_no_tests_ran(monkeypatch):
+    def fake_ask_agent(agent, conversation):
+        return {
+            "answer": "Proposed the change - waiting for approval.",
+            "tool_calls": [_tool_call("propose_file_change")],
+            "workflow_states": ["PROPOSING_CHANGE"],
+            "pending_change_ids": ["abc"],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [new_human_message("Add a feature.")]
+    result = run_agent_turn(object(), conversation)
+
+    assert "COMPLETED" not in result["workflow_states"]
+    assert "FAILED" not in result["workflow_states"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: richer workflow-state derivation (PROPOSING_CHANGE, RETESTING,
+# REGRESSION_TESTING, ANALYZING/FIXING) from real tool calls and run_pytest's
+# own real "Exit code:" output - never fabricated.
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_call_passed_reads_real_exit_code():
+    assert _pytest_call_passed("Exit code: 0\n\n5 passed") is True
+    assert _pytest_call_passed("Exit code: 1\n\n1 failed") is False
+    assert _pytest_call_passed("Error: the test suite took too long to run") is None
+
+
+def test_derive_workflow_states_maps_propose_to_proposing_change():
+    states = _derive_workflow_states([_tool_call("propose_file_change")])
+    assert states == ["PROPOSING_CHANGE"]
+
+
+def test_derive_workflow_states_maps_apply_to_implementing():
+    states = _derive_workflow_states([_tool_call("apply_approved_change")])
+    assert states == ["IMPLEMENTING"]
+
+
+def test_derive_workflow_states_first_run_pytest_is_testing():
+    states = _derive_workflow_states([_tool_call("run_pytest", "Exit code: 0\n\nok")])
+    assert states == ["TESTING"]
+
+
+def test_derive_workflow_states_run_pytest_after_apply_is_retesting():
+    states = _derive_workflow_states(
+        [
+            _tool_call("run_pytest", "Exit code: 1\n\n1 failed"),
+            _tool_call("apply_approved_change"),
+            _tool_call("run_pytest", "Exit code: 0\n\nok"),
+        ]
+    )
+    assert states[-1] == "RETESTING"
+
+
+def test_derive_workflow_states_run_pytest_without_new_apply_is_regression_testing():
+    states = _derive_workflow_states(
+        [
+            _tool_call("run_pytest", "Exit code: 0\n\nok"),
+            _tool_call("run_pytest", "Exit code: 0\n\nok"),
+        ]
+    )
+    assert states[-1] == "REGRESSION_TESTING"
+
+
+def test_derive_workflow_states_propose_after_failure_shows_analyzing_and_fixing():
+    states = _derive_workflow_states(
+        [
+            _tool_call("run_pytest", "Exit code: 1\n\n1 failed"),
+            _tool_call("propose_file_change"),
+        ]
+    )
+    assert states == ["TESTING", "ANALYZING", "FIXING", "PROPOSING_CHANGE"]
+
+
+def test_derive_workflow_states_propose_without_prior_failure_skips_analyzing():
+    states = _derive_workflow_states(
+        [
+            _tool_call("list_project_files"),
+            _tool_call("propose_file_change"),
+        ]
+    )
+    assert states == ["INSPECTING", "PROPOSING_CHANGE"]
+
+
+def test_ask_agent_includes_waiting_for_approval_in_returned_workflow_states():
+    """Regression test: WAITING_FOR_APPROVAL was previously only logged to
+    the terminal, never actually added to the workflow_states list the UI
+    reads - so the Streamlit caption never reflected it."""
+    import workflow as workflow_module
+
+    change = workflow_module.register_change("tools.py", "create", "x = 1\n", "t")
+    try:
+        ai_call = AIMessage(
+            content="",
+            tool_calls=[{"id": "call_1", "name": "propose_file_change", "args": {}}],
+        )
+        tool_result = ToolMessage(
+            content=(
+                f"Proposed change registered: id={change.change_id}, "
+                "action=create, file=tools.py, risk=low."
+            ),
+            name="propose_file_change",
+            tool_call_id="call_1",
+        )
+        final = AIMessage(
+            content=f"Proposed change {change.change_id} - please approve it."
+        )
+        messages = [
+            HumanMessage(content="Add a feature"),
+            ai_call,
+            tool_result,
+            final,
+        ]
+
+        result = ask_agent(_FakeAgent(messages), messages)
+
+        assert "WAITING_FOR_APPROVAL" in result["workflow_states"]
+    finally:
+        workflow_module.clear_all_changes()

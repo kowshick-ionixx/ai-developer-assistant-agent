@@ -39,11 +39,13 @@ class WorkflowStatus(str, Enum):
     PLANNING = "PLANNING"
     INSPECTING = "INSPECTING"
     SEARCHING_DOCUMENTATION = "SEARCHING_DOCUMENTATION"
+    PROPOSING_CHANGE = "PROPOSING_CHANGE"
     IMPLEMENTING = "IMPLEMENTING"
     TESTING = "TESTING"
     ANALYZING = "ANALYZING"
     FIXING = "FIXING"
     RETESTING = "RETESTING"
+    REGRESSION_TESTING = "REGRESSION_TESTING"
     REVIEWING = "REVIEWING"
     WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
     COMPLETED = "COMPLETED"
@@ -58,35 +60,52 @@ _ALLOWED_TRANSITIONS: dict[WorkflowStatus, set[WorkflowStatus]] = {
     WorkflowStatus.PLANNING: {WorkflowStatus.INSPECTING, WorkflowStatus.FAILED},
     WorkflowStatus.INSPECTING: {
         WorkflowStatus.SEARCHING_DOCUMENTATION,
+        WorkflowStatus.PROPOSING_CHANGE,
         WorkflowStatus.IMPLEMENTING,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.SEARCHING_DOCUMENTATION: {
+        WorkflowStatus.PROPOSING_CHANGE,
+        WorkflowStatus.IMPLEMENTING,
+        WorkflowStatus.FAILED,
+    },
+    WorkflowStatus.PROPOSING_CHANGE: {
+        WorkflowStatus.WAITING_FOR_APPROVAL,
         WorkflowStatus.IMPLEMENTING,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.IMPLEMENTING: {
         WorkflowStatus.WAITING_FOR_APPROVAL,
         WorkflowStatus.TESTING,
+        WorkflowStatus.RETESTING,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.WAITING_FOR_APPROVAL: {
         WorkflowStatus.IMPLEMENTING,
         WorkflowStatus.TESTING,
+        WorkflowStatus.PROPOSING_CHANGE,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.TESTING: {
         WorkflowStatus.ANALYZING,
+        WorkflowStatus.REGRESSION_TESTING,
         WorkflowStatus.REVIEWING,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.ANALYZING: {WorkflowStatus.FIXING, WorkflowStatus.FAILED},
     WorkflowStatus.FIXING: {
         WorkflowStatus.RETESTING,
+        WorkflowStatus.PROPOSING_CHANGE,
         WorkflowStatus.WAITING_FOR_APPROVAL,
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.RETESTING: {
+        WorkflowStatus.REGRESSION_TESTING,
+        WorkflowStatus.REVIEWING,
+        WorkflowStatus.ANALYZING,
+        WorkflowStatus.FAILED,
+    },
+    WorkflowStatus.REGRESSION_TESTING: {
         WorkflowStatus.REVIEWING,
         WorkflowStatus.ANALYZING,
         WorkflowStatus.FAILED,

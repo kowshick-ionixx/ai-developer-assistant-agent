@@ -95,6 +95,43 @@ def test_repair_loop_can_reach_waiting_for_approval_and_retesting():
     assert state.status == WorkflowStatus.COMPLETED
 
 
+def test_full_propose_to_completed_sequence_including_new_states():
+    """Regression test: PROPOSING_CHANGE and REGRESSION_TESTING must exist
+    and be reachable as part of the full Phase 6 sequence - a request to add
+    these states to the state machine (they were previously missing)."""
+    state = WorkflowState(user_task="Add a feature")
+    state.transition_to(WorkflowStatus.PLANNING)
+    state.transition_to(WorkflowStatus.INSPECTING)
+    state.transition_to(WorkflowStatus.PROPOSING_CHANGE)
+    state.transition_to(WorkflowStatus.WAITING_FOR_APPROVAL)
+    state.transition_to(WorkflowStatus.IMPLEMENTING)
+    state.transition_to(WorkflowStatus.TESTING)
+    state.transition_to(WorkflowStatus.REGRESSION_TESTING)
+    state.transition_to(WorkflowStatus.REVIEWING)
+    state.transition_to(WorkflowStatus.COMPLETED)
+    assert state.status == WorkflowStatus.COMPLETED
+
+
+def test_repair_loop_can_reach_proposing_change_and_regression_testing():
+    state = WorkflowState(user_task="Add a feature")
+    state.transition_to(WorkflowStatus.PLANNING)
+    state.transition_to(WorkflowStatus.INSPECTING)
+    state.transition_to(WorkflowStatus.PROPOSING_CHANGE)
+    state.transition_to(WorkflowStatus.WAITING_FOR_APPROVAL)
+    state.transition_to(WorkflowStatus.IMPLEMENTING)
+    state.transition_to(WorkflowStatus.TESTING)
+    state.transition_to(WorkflowStatus.ANALYZING)
+    state.transition_to(WorkflowStatus.FIXING)
+    state.transition_to(WorkflowStatus.PROPOSING_CHANGE)
+    state.transition_to(WorkflowStatus.WAITING_FOR_APPROVAL)
+    state.transition_to(WorkflowStatus.IMPLEMENTING)
+    state.transition_to(WorkflowStatus.RETESTING)
+    state.transition_to(WorkflowStatus.REGRESSION_TESTING)
+    state.transition_to(WorkflowStatus.REVIEWING)
+    state.transition_to(WorkflowStatus.COMPLETED)
+    assert state.status == WorkflowStatus.COMPLETED
+
+
 def test_mark_step_complete_moves_step_between_lists():
     state = WorkflowState(user_task="Add a feature")
     state.pending_steps = ["Inspect project", "Run tests"]

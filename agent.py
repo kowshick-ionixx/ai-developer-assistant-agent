@@ -201,7 +201,10 @@ concisely - do not hide your steps, but do not narrate raw chain-of-thought eith
 
 1. Plan: state a short numbered plan (a handful of concrete steps, e.g. "1. Inspect
    project 2. Find related files 3. Propose change 4. Create/update tests 5. Run tests
-   6. Report") before doing anything else.
+   6. Report") - then, in that SAME response, immediately continue by actually calling
+   the tool(s) the first step needs. Never end a response with only the plan and no
+   tool call unless you genuinely need the user to answer something first - stating the
+   plan is the start of your turn, not the end of it.
 2. Inspect: use list_project_files/read_project_file/search_project (and
    documentation_search/web_search if current external guidance is needed) to ground the
    plan in the actual project - never guess file contents or structure. Also call
@@ -479,27 +482,87 @@ _TOOL_TO_WORKFLOW_STATUS = {
     "github_get_pull_requests": WorkflowStatus.INSPECTING,
     "documentation_search": WorkflowStatus.SEARCHING_DOCUMENTATION,
     "web_search": WorkflowStatus.SEARCHING_DOCUMENTATION,
-    "propose_file_change": WorkflowStatus.IMPLEMENTING,
-    "apply_approved_change": WorkflowStatus.IMPLEMENTING,
     "list_pending_changes": WorkflowStatus.INSPECTING,
-    "run_pytest": WorkflowStatus.TESTING,
     "run_ruff": WorkflowStatus.TESTING,
     "run_black": WorkflowStatus.TESTING,
     "check_python_syntax": WorkflowStatus.TESTING,
+    # propose_file_change/apply_approved_change/run_pytest are handled
+    # separately below - their workflow status depends on *when* in the
+    # sequence (and, for run_pytest, on its own real pass/fail result) they
+    # were called, not just their tool name.
 }
 
 _CHANGE_ID_RE = re.compile(r"id=([0-9a-f]+)")
+_PYTEST_EXIT_CODE_RE = re.compile(r"^Exit code:\s*(\d+)")
+
+
+def _pytest_call_passed(output) -> bool | None:
+    """Read run_pytest's own real "Exit code: N" prefix (see tools.py's
+    run_pytest) to tell whether one specific call passed. Returns None if
+    the output doesn't match that format (e.g. a "no tests/ folder" or
+    timeout error before pytest ever produced an exit code) - callers must
+    never guess a pass/fail they can't actually confirm from real output."""
+    match = _PYTEST_EXIT_CODE_RE.match(str(output).strip())
+    if not match:
+        return None
+    return match.group(1) == "0"
 
 
 def _derive_workflow_states(tool_calls: list[dict]) -> list[str]:
-    """Collapse this turn's actual tool calls into a short workflow-status
+    """Collapse this turn's actual tool calls into a workflow-status
     sequence (consecutive duplicates merged) for [WORKFLOW] logging/UI
-    display. Empty if no tool was called this turn."""
+    display - purely descriptive, derived only from real tool names and
+    real tool output, never fabricated. Empty if no tool was called this
+    turn.
+
+    propose_file_change/apply_approved_change/run_pytest get finer-grained
+    handling than a flat name->status lookup because the same tool name
+    means something different depending on where it falls in the sequence:
+    a propose_file_change that follows an earlier failing run_pytest call in
+    this same turn is really "a fix being proposed" (shown as
+    ANALYZING -> FIXING -> PROPOSING_CHANGE); the first run_pytest call in a
+    turn is the initial TESTING pass, a later one right after a fresh
+    apply_approved_change is RETESTING (checking whether that fix worked),
+    and a later one with no new apply in between is REGRESSION_TESTING (a
+    deliberate full-suite confirmation with nothing new applied since).
+    """
     states: list[str] = []
-    for call in tool_calls:
-        status = _TOOL_TO_WORKFLOW_STATUS.get(call["name"])
-        if status and (not states or states[-1] != status.value):
+
+    def _append(status: WorkflowStatus) -> None:
+        if not states or states[-1] != status.value:
             states.append(status.value)
+
+    run_pytest_seen = 0
+    saw_failure_since_last_fix = False
+    applied_since_last_test = False
+
+    for call in tool_calls:
+        name = call["name"]
+        if name == "propose_file_change":
+            if saw_failure_since_last_fix:
+                _append(WorkflowStatus.ANALYZING)
+                _append(WorkflowStatus.FIXING)
+            _append(WorkflowStatus.PROPOSING_CHANGE)
+        elif name == "apply_approved_change":
+            _append(WorkflowStatus.IMPLEMENTING)
+            applied_since_last_test = True
+        elif name == "run_pytest":
+            run_pytest_seen += 1
+            if run_pytest_seen == 1:
+                _append(WorkflowStatus.TESTING)
+            elif applied_since_last_test:
+                _append(WorkflowStatus.RETESTING)
+            else:
+                _append(WorkflowStatus.REGRESSION_TESTING)
+            applied_since_last_test = False
+            saw_failure_since_last_fix = (
+                _pytest_call_passed(call.get("output", "")) is False
+            )
+        else:
+            status = _TOOL_TO_WORKFLOW_STATUS.get(name)
+            if status:
+                _append(status)
+
     return states
 
 
@@ -598,6 +661,7 @@ def ask_agent(agent, conversation: list) -> dict:
         log_approval_waiting(change_id, change.file_path if change else "?")
     if pending_change_ids:
         log_workflow_state(WorkflowStatus.WAITING_FOR_APPROVAL.value)
+        workflow_states.append(WorkflowStatus.WAITING_FOR_APPROVAL.value)
 
     final_message = messages[-1]
     answer = _extract_text(final_message.content)
@@ -639,3 +703,166 @@ def new_human_message(text: str) -> HumanMessage:
 def new_ai_message(text: str) -> AIMessage:
     """Small helper so app.py doesn't need to import langchain_core directly."""
     return AIMessage(content=text)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: development-task classification and the auto-continuation
+# orchestrator that keeps a controlled development task moving instead of
+# stalling after the model merely describes its plan or findings.
+# ---------------------------------------------------------------------------
+
+_CLASSIFY_INSTRUCTION = (
+    "Classify the software-assistant request below as exactly one word: "
+    "DEVELOPMENT or OTHER.\n\n"
+    "DEVELOPMENT: the user wants code added, written, fixed, refactored, or tested in "
+    "their project - e.g. 'add a function that...', 'write a function to check whether "
+    "a number is prime', 'fix the bug in...', 'refactor...', 'create pytest tests "
+    "for...'. A math or logic word in the request (factorial, prime, sum, sort, ...) "
+    "describing what the CODE should do still means DEVELOPMENT, never OTHER - it is "
+    "not a request to compute one value right now.\n"
+    "OTHER: anything else - a one-off calculation ('what is 5 factorial?', 'calculate "
+    "25 * 8'), a conceptual question, a request to only explain/review/run/lint "
+    "existing code without changing it, or an unrelated question.\n\n"
+    "Output ONLY the single word DEVELOPMENT or OTHER - nothing else."
+)
+
+
+def classify_request(user_task: str) -> bool:
+    """Return True if `user_task` is a Phase 6 development request (add/fix/refactor/
+    test code in this project) rather than a one-off calculation, conceptual question,
+    or read-only request - decided by a single, dedicated Gemini completion call
+    instead of keyword matching (see ## Request Classification in SYSTEM_PROMPT), so
+    e.g. "add a function to calculate the factorial of a number" is never mistaken for
+    "what is 5 factorial?" just because both mention "factorial".
+
+    This only decides whether run_agent_turn() applies its bounded auto-continuation
+    loop below - it never changes what the main tool-using agent itself is allowed to
+    do, and it is a single plain completion call (like create_plan), not the
+    tool-using agent.
+    """
+    llm = _build_llm(temperature=0.0)
+    message = HumanMessage(content=f"{_CLASSIFY_INSTRUCTION}\n\nRequest: {user_task}")
+    response = llm.invoke([message])
+    text = _extract_text(response.content).strip().upper()
+    return text.startswith("DEVELOPMENT")
+
+
+def _latest_human_text(conversation: list) -> str | None:
+    for message in reversed(conversation):
+        if isinstance(message, HumanMessage):
+            return _extract_text(message.content)
+    return None
+
+
+MAX_AUTO_CONTINUE_STEPS = 5
+
+_CONTINUE_NUDGE = (
+    "Continue the task now - don't just restate your plan or findings in text. "
+    "Actually call the next tool(s) you need (list_project_files, search_project, "
+    "read_project_file, propose_file_change, run_pytest, etc.) to make real progress "
+    "on the task. If you have already proposed every file change this task needs, "
+    "stop here and wait for approval instead of repeating yourself. If you genuinely "
+    "need information only the user can provide, ask a specific question instead."
+)
+
+
+def run_agent_turn(agent, conversation: list) -> dict:
+    """Drive one user-visible turn all the way through Phase 6's development
+    workflow instead of a single free-form agent.invoke() call.
+
+    A Phase 6 development request (e.g. "add a function, test it, run the tests, fix
+    any failures") needs many chained tool calls - inspect, propose, wait for
+    approval, apply, test, analyze, fix, retest, review. create_agent's underlying
+    ReAct loop keeps calling tools on its own *as long as the model keeps requesting
+    them*, but in practice the model sometimes stops after describing its plan or
+    findings in plain text instead of continuing to act, which ends that loop early -
+    the exact "stops at planning/inspecting" failure this exists to fix.
+
+    This wraps ask_agent() with a bounded auto-continuation loop: after a turn that
+    made no progress toward a legitimate pause point (a proposed change actually
+    awaiting human approval) and isn't a question back to the user, it nudges the SAME
+    agent - via a plain follow-up message, never a second agent - to actually call its
+    tools instead of describing what it would do next. Capped at
+    MAX_AUTO_CONTINUE_STEPS attempts, with an earlier bail-out the moment two
+    consecutive attempts produce no tool call at all, so this can never loop forever
+    (mirrors the same "never infinite loop" principle as MAX_REPAIR_ATTEMPTS).
+
+    Non-development requests (calculations, conceptual questions, one-off code
+    review/generation/debugging) are classified as such by classify_request() and
+    passed straight through to ask_agent() with no change in behavior.
+
+    Returns the same shape as ask_agent(), with tool_calls/workflow_states
+    accumulated across every internal step, `answer` = the final step's text, and
+    pending_change_ids/REVIEWING+COMPLETED/FAILED reflecting the overall outcome.
+    """
+    last_human = _latest_human_text(conversation)
+    is_dev = False
+    if last_human is not None:
+        try:
+            is_dev = classify_request(last_human)
+        except Exception:  # noqa: BLE001 - never let this pre-check break the chat
+            # If classification fails (e.g. a transient API error), the main
+            # agent call below will surface the same underlying problem on
+            # its own.
+            is_dev = False
+
+    if not is_dev:
+        return ask_agent(agent, conversation)
+
+    log_workflow_state(WorkflowStatus.PLANNING.value)
+
+    working_conversation = list(conversation)
+    all_tool_calls: list[dict] = []
+    all_workflow_states: list[str] = []
+    consecutive_idle = 0
+    result: dict = {}
+
+    for step in range(MAX_AUTO_CONTINUE_STEPS):
+        result = ask_agent(agent, working_conversation)
+        all_tool_calls.extend(result.get("tool_calls", []))
+        all_workflow_states.extend(result.get("workflow_states", []))
+
+        if result.get("pending_change_ids"):
+            break  # a legitimate pause point - waiting on human approval
+
+        step_tool_calls = result.get("tool_calls") or []
+        consecutive_idle = 0 if step_tool_calls else consecutive_idle + 1
+        last_call = step_tool_calls[-1] if step_tool_calls else None
+        last_test_passed = (
+            last_call is not None
+            and last_call.get("name") == "run_pytest"
+            and _pytest_call_passed(last_call.get("output", "")) is True
+        )
+        answer = (result.get("answer") or "").strip()
+        done = (
+            answer.endswith("?")
+            or answer == SCOPE_REFUSAL_MESSAGE
+            or consecutive_idle >= 2
+            or last_test_passed  # a passing full-suite run with nothing else
+            # pending is the natural end of the execution phase - no point
+            # nudging further and risking the model proposing needless
+            # extra "fixes" for a suite that's already green.
+            or step == MAX_AUTO_CONTINUE_STEPS - 1
+        )
+        if done:
+            break
+
+        working_conversation.append(new_ai_message(result.get("answer", "")))
+        working_conversation.append(new_human_message(_CONTINUE_NUDGE))
+
+    if not result.get("pending_change_ids"):
+        pytest_calls = [tc for tc in all_tool_calls if tc.get("name") == "run_pytest"]
+        if pytest_calls:
+            passed = _pytest_call_passed(pytest_calls[-1].get("output", ""))
+            all_workflow_states.append(WorkflowStatus.REVIEWING.value)
+            log_workflow_state(WorkflowStatus.REVIEWING.value)
+            if passed is True:
+                all_workflow_states.append(WorkflowStatus.COMPLETED.value)
+                log_workflow_state(WorkflowStatus.COMPLETED.value)
+            elif passed is False:
+                all_workflow_states.append(WorkflowStatus.FAILED.value)
+                log_workflow_state(WorkflowStatus.FAILED.value)
+
+    result["tool_calls"] = all_tool_calls
+    result["workflow_states"] = all_workflow_states
+    return result
