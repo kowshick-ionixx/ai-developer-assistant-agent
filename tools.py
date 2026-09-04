@@ -594,12 +594,14 @@ def run_black(code: str = "", file_path: str = "") -> str:
     - `code`: a snippet of Python code to format directly. It is passed to
       Black over stdin and is never written to disk; the formatted code is
       returned so it can be shown to the user.
-    - `file_path`: a path to a Python file inside this project to check.
-      This NEVER overwrites the file - it only reports whether it is
-      already formatted and returns the diff Black would apply.
+    - `file_path`: a path to a Python file inside this project to check, a
+      subdirectory to check every file under it, or "." to check the entire
+      project. This NEVER overwrites anything - it only reports whether the
+      target is already formatted and returns the diff Black would apply.
 
     Use this whenever the user asks to format Python code, or to check
-    Black formatting on pasted code or a project file.
+    Black formatting on pasted code, a single project file, or the whole
+    project (pass file_path=".").
     """
     log_tool_call("run_black")
     if code and file_path:
@@ -640,8 +642,12 @@ def run_black(code: str = "", file_path: str = "") -> str:
                 result = f"Error: '{file_path}' is outside the project directory and cannot be checked."
                 log_tool_result(result)
                 return result
-            if not safe_path.is_file():
-                result = f"Error: file '{file_path}' was not found in the project."
+            if _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+                result = f"Error: '{file_path}' cannot be checked for security reasons."
+                log_tool_result(result)
+                return result
+            if not safe_path.exists():
+                result = f"Error: '{file_path}' was not found in the project."
                 log_tool_result(result)
                 return result
             result = subprocess.run(
@@ -652,14 +658,20 @@ def run_black(code: str = "", file_path: str = "") -> str:
                 timeout=30,
                 check=False,
             )
+            # safe_path can be this project's own root ("." / "./") or any
+            # subdirectory, not just a single file - phrase the result so it
+            # reads correctly either way instead of always saying "file".
+            target_desc = (
+                "The project" if safe_path == PROJECT_ROOT else f"'{file_path}'"
+            )
             if result.returncode == 0:
                 final = (
-                    f"'{file_path}' is already formatted correctly - no changes needed."
+                    f"{target_desc} is already formatted correctly - no changes needed."
                 )
             else:
                 diff = result.stdout.strip()
                 final = (
-                    f"'{file_path}' is not formatted according to Black. The file was NOT "
+                    f"{target_desc} is not formatted according to Black. No files were "
                     f"modified. Here is the diff Black would apply:\n\n{diff}"
                 )
             log_tool_result(final)

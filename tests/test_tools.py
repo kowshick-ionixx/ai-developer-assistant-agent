@@ -88,9 +88,46 @@ def test_run_black_formats_pasted_code():
     assert formatted == "def add(a, b):\n    return a + b\n"
 
 
+def test_run_black_checks_real_project_file():
+    result = run_black.invoke({"file_path": "conftest.py"})
+    assert "outside the project directory" not in result
+    assert "was not found" not in result.lower()
+    assert "conftest.py" in result
+
+
+def test_run_black_accepts_project_root_directory():
+    result = run_black.invoke({"file_path": "."})
+    assert not result.startswith("Error")
+    assert "the project" in result.lower()
+
+
+def test_run_black_accepts_project_root_with_trailing_slash():
+    result = run_black.invoke({"file_path": "./"})
+    assert not result.startswith("Error")
+    assert "the project" in result.lower()
+
+
 def test_run_black_file_path_rejects_directory_traversal():
     result = run_black.invoke({"file_path": "../outside.py"})
     assert "outside the project directory" in result
+
+
+def test_run_black_file_path_rejects_path_traversal_deep():
+    result = run_black.invoke({"file_path": "../../something"})
+    assert "outside the project directory" in result
+
+
+def test_run_black_file_path_rejects_absolute_path_outside_project():
+    result = run_black.invoke(
+        {"file_path": "../../../../Windows/System32/drivers/etc/hosts"}
+    )
+    assert "outside the project directory" in result
+
+
+def test_run_black_file_path_rejects_dot_env():
+    result = run_black.invoke({"file_path": ".env"})
+    assert "cannot be checked" in result.lower()
+    assert "GOOGLE_API_KEY" not in result
 
 
 def test_run_black_file_path_missing_file():
