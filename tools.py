@@ -518,11 +518,21 @@ def run_pytest() -> str:
 
     log_tool_execution("Running pytest...")
     try:
+        # encoding="utf-8" (with errors="replace" as a last resort, mirroring
+        # logger.py's _safe_print) pins subprocess output decoding regardless
+        # of the host's console codepage - text=True alone falls back to
+        # locale.getpreferredencoding() (cp1252 on Windows by default),
+        # which can raise UnicodeDecodeError on real UTF-8 subprocess output
+        # (e.g. Ruff/Black/pytest output touching a file with non-Latin
+        # characters) well before this function ever gets to return an
+        # error string.
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "tests", "-v", "--no-header"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             check=False,
         )
@@ -593,6 +603,8 @@ def run_ruff(code: str = "", file_path: str = "") -> str:
                 input=code,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 check=False,
             )
@@ -615,6 +627,8 @@ def run_ruff(code: str = "", file_path: str = "") -> str:
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 check=False,
             )
@@ -679,6 +693,8 @@ def run_black(code: str = "", file_path: str = "") -> str:
                 input=code,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 check=False,
             )
@@ -710,6 +726,8 @@ def run_black(code: str = "", file_path: str = "") -> str:
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 check=False,
             )

@@ -17,6 +17,7 @@ calls the functions below.
 """
 
 import base64
+import logging
 import os
 import re
 
@@ -63,6 +64,13 @@ from workflow import WorkflowStatus
 from workflow import get_change as get_pending_change
 
 load_dotenv()
+
+# The google-genai SDK logs a one-time "use Chat.send_message instead of
+# Models.generate_content" advisory on every fresh process - it's aimed at
+# library authors, not this app's users, and clutters the CLI/terminal
+# output on the very first request. It's a log message, not a raised
+# warning, so logging.getLogger(...).setLevel() is what actually silences it.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 SCOPE_REFUSAL_MESSAGE = (
     "I can only assist with tasks related to this AI Developer Assistant project "

@@ -1,14 +1,16 @@
 """
-Tests for app.py's document-attachment and voice-input UI wiring.
+Tests for app.py's document-attachment, voice-input, and Phase 6 approval UI
+wiring.
 
 These drive the real Streamlit script headlessly via streamlit.testing.v1's
 AppTest (no browser, no real Gemini/network calls - agent.run_agent_turn and
-agent.transcribe_audio are monkeypatched). They exist to protect attachment
-state, clearing attachments, upload rejection, voice-to-text reaching the
-existing chat flow, and that the AI Features sidebar panel is informational
-only (no buttons, no auto-inserted or auto-submitted questions).
+agent.transcribe_audio are monkeypatched). The default page is Chat (the
+primary page); several tests switch st.session_state["nav_view"] to reach
+the Documents/Changes pages where attachment clearing and change approval
+now live in the redesigned UI.
 """
 
+import re
 import types
 from pathlib import Path
 
@@ -65,6 +67,14 @@ def _fake_chat_value(text="", files=None, audio=None):
     return types.SimpleNamespace(text=text, files=files or [], audio=audio)
 
 
+def _goto(at, page: str):
+    """Switch the redesigned app's page router and re-run."""
+    at.session_state["nav_view"] = page
+    at.run(timeout=30)
+    assert at.exception == []
+    return at
+
+
 def test_no_files_attached_initially(apptest_with_mocked_agent):
     at = apptest_with_mocked_agent
     assert at.session_state["attached_files"] == []
@@ -91,11 +101,10 @@ def test_clear_attachments_button_empties_attached_files(apptest_with_mocked_age
     at.session_state["attached_files"] = [
         process_upload("example.py", b"print('hi')\n")
     ]
-    at.run(timeout=30)
-    assert at.exception == []
+    _goto(at, "Documents")
     assert at.session_state["attached_files"] != []
 
-    clear_btn = next(b for b in at.sidebar.button if b.label == "🗑 Clear Attachments")
+    clear_btn = next(b for b in at.button if b.label == "Clear all attachments")
     clear_btn.click()
     at.run(timeout=30)
     assert at.exception == []
@@ -106,15 +115,15 @@ def test_clearing_attachments_does_not_touch_conversation(apptest_with_mocked_ag
     at = apptest_with_mocked_agent
     from documents import process_upload
 
-    # Send one normal message first.
+    # Send one normal message first (Chat is the default page).
     at.chat_input[0].set_value("What is Python?").run(timeout=30)
     assert at.exception == []
     message_count_before = len(at.session_state["messages"])
     assert message_count_before > 0
 
     at.session_state["attached_files"] = [process_upload("a.py", b"x = 1\n")]
-    at.run(timeout=30)
-    clear_btn = next(b for b in at.sidebar.button if b.label == "🗑 Clear Attachments")
+    _goto(at, "Documents")
+    clear_btn = next(b for b in at.button if b.label == "Clear all attachments")
     clear_btn.click()
     at.run(timeout=30)
 
@@ -171,15 +180,13 @@ def test_voice_input_is_transcribed_and_flows_through_normal_chat(
     assert messages[-1]["content"].startswith("MOCKED REPLY")
 
 
-def test_attaching_file_with_question_in_one_submission_updates_sidebar_same_turn(
+def test_attaching_file_with_question_in_one_submission_updates_state_same_turn(
     apptest_with_mocked_agent, monkeypatch
 ):
-    # Regression test: the "Attached Files" sidebar section is rendered
-    # earlier in the script than the chat_input handling code, so without an
-    # internal rerun a newly attached file would only appear in the sidebar
-    # on the *next* interaction, not the one that attached it. Confirms
-    # session_state (what the sidebar reads) is updated within this same
-    # at.run() call, immediately after a combined attach+ask submission.
+    # Regression test: attachment handling and the chat-input handling code
+    # live in the same render pass - without an internal rerun, a newly
+    # attached file would only be reflected in session_state on the *next*
+    # interaction, not the one that attached it.
     at = apptest_with_mocked_agent
 
     import app as app_module
@@ -259,7 +266,89 @@ def test_oversized_file_upload_is_rejected_and_not_attached(
     assert at.session_state["attached_files"] == []
 
 
-def test_ai_features_panel_lists_all_five_phases_with_no_buttons(
+# ---------------------------------------------------------------------------
+# Regression tests: clicking a nav-switching control used to crash with
+# `StreamlitAPIException: st.session_state.nav_view cannot be modified
+# after the widget with key nav_view is instantiated` - found via live
+# manual testing, not by the suite (none of these clicked before). The fix
+# (_request_nav_change) hands the target page off through a plain
+# `_nav_request` key that the sidebar consumes *before* re-creating the
+# nav_view-bound radio widget, instead of writing nav_view directly from a
+# button handler that runs after that widget.
+# ---------------------------------------------------------------------------
+
+
+def test_header_settings_button_switches_page_without_crashing(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    settings_btn = next(b for b in at.button if b.key == "header_settings")
+    settings_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+    assert at.session_state["nav_view"] == "Settings"
+
+
+def test_sidebar_review_changes_button_switches_page_without_crashing(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+    review_btn = next(b for b in at.sidebar.button if b.label == "Review changes")
+    review_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+    assert at.session_state["nav_view"] == "Changes"
+
+
+def test_home_shortcut_switches_to_chat_and_submits_without_crashing(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    at.session_state["nav_view"] = "Home"
+    at.run(timeout=30)
+    home_btn = next(b for b in at.button if b.key == "home_Run Tests")
+    home_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+    assert at.session_state["nav_view"] == "Chat"
+    assert at.session_state["messages"][-1]["content"].startswith("MOCKED REPLY")
+
+
+def test_injected_style_block_has_no_blank_lines():
+    """Regression test for a real bug found via visual (Playwright)
+    inspection: Streamlit's markdown-to-HTML pass treats a raw HTML block
+    as ended by the first blank line inside it (a CommonMark HTML-block
+    rule), so a blank line inside the app's injected <style>...</style>
+    silently truncated the stylesheet mid-parse - every CSS rule after
+    that point rendered as literal visible page text instead of being
+    applied as styling. No AppTest-based test (which only checks for
+    Python exceptions/session state, never rendered visible text) could
+    have caught this - only an actual screenshot did."""
+    app_source = Path(__file__).resolve().parent.parent / "app.py"
+    text = app_source.read_text(encoding="utf-8")
+    match = re.search(r"<style>(.*?)</style>", text, re.DOTALL)
+    assert match is not None, "app.py must inject a <style> block"
+    style_body = match.group(1)
+    lines = style_body.split("\n")
+    # The very last split segment is just the whitespace indentation before
+    # the closing </style> tag on its own line, e.g. "    </style>" - that
+    # trailing indentation is not a real blank *line* in the source file
+    # (nothing follows it inside the block), so it's excluded here.
+    blank_line_numbers = [
+        index for index, line in enumerate(lines[:-1]) if line.strip() == ""
+    ]
+    assert blank_line_numbers == [], (
+        f"Found blank line(s) inside <style> at offset(s) {blank_line_numbers} "
+        "within the block - this truncates the stylesheet early and leaks "
+        "the remaining CSS as visible page text."
+    )
+
+
+def test_capabilities_panel_lists_all_five_phases_with_no_buttons(
     apptest_with_mocked_agent,
 ):
     at = apptest_with_mocked_agent
@@ -272,15 +361,14 @@ def test_ai_features_panel_lists_all_five_phases_with_no_buttons(
     assert any("Phase 5" in label for label in phase_labels)
 
     phase1 = next(e for e in at.sidebar.expander if "Phase 1" in e.label)
-    # Information only: no buttons inside a phase's reference panel (the
-    # only sidebar buttons left are Clear Attachments / Clear Conversation).
+    # Information only: no buttons inside a phase's reference panel.
     assert len(phase1.button) == 0
     phase1_text = "\n".join(m.value for m in phase1.markdown)
     assert "Calculator" in phase1_text
     assert "Example capability" in phase1_text
 
 
-def test_expanding_ai_features_panel_does_not_touch_chat_or_pending_prompt(
+def test_expanding_capabilities_panel_does_not_touch_chat_or_pending_prompt(
     apptest_with_mocked_agent,
 ):
     at = apptest_with_mocked_agent
@@ -288,8 +376,9 @@ def test_expanding_ai_features_panel_does_not_touch_chat_or_pending_prompt(
     messages_before = list(at.session_state["messages"])
     assert at.session_state["pending_prompt"] is None
 
-    # Merely having the AI Features expanders rendered (as they are on every
-    # run of this fixture) must never insert, select, or submit a question.
+    # Merely having the Capabilities expanders rendered (as they are on
+    # every run of this fixture) must never insert, select, or submit
+    # a question.
     at.run(timeout=30)
     assert at.exception == []
 
@@ -298,54 +387,55 @@ def test_expanding_ai_features_panel_does_not_touch_chat_or_pending_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Phase 6: Pending Approvals sidebar (propose -> human approve/reject -> apply)
+# Phase 6: the Changes page (propose -> human approve/reject -> apply).
+# Approving now always drives the real apply-and-test continuation - the
+# old "sidebar approve is mark-only, chat approve resumes" split has been
+# deliberately retired in favor of one consolidated Approve action.
 # ---------------------------------------------------------------------------
 
 
 def test_no_pending_changes_shows_empty_state(apptest_with_mocked_agent):
-    at = apptest_with_mocked_agent
-    markdown_text = "\n".join(m.value for m in at.sidebar.markdown)
-    caption_text = "\n".join(c.value for c in at.sidebar.caption)
-    assert "No pending changes" in markdown_text + caption_text
+    at = _goto(apptest_with_mocked_agent, "Changes")
+    markdown_text = "\n".join(m.value for m in at.markdown)
+    assert "No pending changes" in markdown_text
 
 
-def test_pending_change_appears_in_sidebar_with_approve_reject_buttons(
+def test_pending_change_appears_with_approve_reject_buttons(
+    apptest_with_mocked_agent,
+):
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at = _goto(apptest_with_mocked_agent, "Changes")
+
+    markdown_text = "\n".join(m.value for m in at.markdown)
+    caption_text = "\n".join(c.value for c in at.caption)
+    assert change.file_path in markdown_text
+    assert change.change_id in caption_text
+
+    button_keys = {b.key for b in at.button}
+    assert f"approve_{change.change_id}" in button_keys
+    assert f"reject_{change.change_id}" in button_keys
+
+
+def test_clicking_approve_marks_the_change_approved_and_resumes(
     apptest_with_mocked_agent,
 ):
     at = apptest_with_mocked_agent
     change = workflow.register_change(
         file_path="demo.py", action="create", content="x = 1\n", reason="demo"
     )
-    at.run(timeout=30)
-    assert at.exception == []
+    at = _goto(at, "Changes")
 
-    expander_labels = [e.label for e in at.sidebar.expander]
-    assert any(change.change_id in label for label in expander_labels)
-
-    matching_expander = next(
-        e for e in at.sidebar.expander if change.change_id in e.label
-    )
-    button_labels = {b.label for b in matching_expander.button}
-    assert "✅ Approve" in button_labels
-    assert "❌ Reject" in button_labels
-
-
-def test_clicking_approve_sets_change_approved(apptest_with_mocked_agent):
-    at = apptest_with_mocked_agent
-    change = workflow.register_change(
-        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
-    )
-    at.run(timeout=30)
-
-    matching_expander = next(
-        e for e in at.sidebar.expander if change.change_id in e.label
-    )
-    approve_btn = next(b for b in matching_expander.button if b.label == "✅ Approve")
+    approve_btn = next(b for b in at.button if b.key == f"approve_{change.change_id}")
     approve_btn.click()
     at.run(timeout=30)
     assert at.exception == []
 
     assert workflow.get_change(change.change_id).approved is True
+    # Approving now resumes the real turn-runner (mocked in this fixture),
+    # so a new assistant reply should have been recorded too.
+    assert at.session_state["messages"][-1]["content"].startswith("MOCKED REPLY")
 
 
 def test_clicking_reject_removes_pending_change(apptest_with_mocked_agent):
@@ -353,39 +443,15 @@ def test_clicking_reject_removes_pending_change(apptest_with_mocked_agent):
     change = workflow.register_change(
         file_path="demo.py", action="create", content="x = 1\n", reason="demo"
     )
-    at.run(timeout=30)
+    at = _goto(at, "Changes")
 
-    matching_expander = next(
-        e for e in at.sidebar.expander if change.change_id in e.label
-    )
-    reject_btn = next(b for b in matching_expander.button if b.label == "❌ Reject")
+    reject_btn = next(b for b in at.button if b.key == f"reject_{change.change_id}")
     reject_btn.click()
     at.run(timeout=30)
     assert at.exception == []
 
     assert workflow.get_change(change.change_id) is None
     assert workflow.list_pending_changes() == []
-
-
-def test_approving_a_change_does_not_touch_conversation_or_other_state(
-    apptest_with_mocked_agent,
-):
-    at = apptest_with_mocked_agent
-    at.chat_input[0].set_value("What is Python?").run(timeout=30)
-    messages_before = list(at.session_state["messages"])
-
-    change = workflow.register_change(
-        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
-    )
-    at.run(timeout=30)
-    matching_expander = next(
-        e for e in at.sidebar.expander if change.change_id in e.label
-    )
-    approve_btn = next(b for b in matching_expander.button if b.label == "✅ Approve")
-    approve_btn.click()
-    at.run(timeout=30)
-
-    assert at.session_state["messages"] == messages_before
 
 
 def test_workflow_states_are_displayed_when_present(
@@ -413,42 +479,39 @@ def test_workflow_states_are_displayed_when_present(
 
 
 # ---------------------------------------------------------------------------
-# Phase 6: repair-attempt circuit breaker reset control
+# Phase 6: repair-attempt circuit breaker reset control (now on Changes page)
 # ---------------------------------------------------------------------------
 
 
 def test_no_repair_warning_when_no_file_has_hit_the_limit(apptest_with_mocked_agent):
-    at = apptest_with_mocked_agent
-    warning_text = "\n".join(w.value for w in at.sidebar.warning)
+    at = _goto(apptest_with_mocked_agent, "Changes")
+    warning_text = "\n".join(w.value for w in at.warning)
     assert "repair-attempt limit" not in warning_text.lower()
-    reset_buttons = [b for b in at.sidebar.button if "Reset repair counter" in b.label]
+    reset_buttons = [b for b in at.button if "Reset repair counter" in b.label]
     assert reset_buttons == []
 
 
 def test_repair_warning_and_reset_button_appear_once_limit_reached(
     apptest_with_mocked_agent,
 ):
-    at = apptest_with_mocked_agent
     for _ in range(workflow.MAX_REPAIR_ATTEMPTS):
         workflow.record_apply("stuck_file.py")
-    at.run(timeout=30)
-    assert at.exception == []
+    at = _goto(apptest_with_mocked_agent, "Changes")
 
-    warning_text = "\n".join(w.value for w in at.sidebar.warning)
+    warning_text = "\n".join(w.value for w in at.warning)
     assert "repair-attempt limit" in warning_text.lower()
     assert "stuck_file.py" in warning_text
 
-    reset_buttons = [b for b in at.sidebar.button if "Reset repair counter" in b.label]
+    reset_buttons = [b for b in at.button if "Reset repair counter" in b.label]
     assert len(reset_buttons) == 1
 
 
 def test_clicking_reset_repair_counter_clears_the_tally(apptest_with_mocked_agent):
-    at = apptest_with_mocked_agent
     for _ in range(workflow.MAX_REPAIR_ATTEMPTS):
         workflow.record_apply("stuck_file.py")
-    at.run(timeout=30)
+    at = _goto(apptest_with_mocked_agent, "Changes")
 
-    reset_btn = next(b for b in at.sidebar.button if "Reset repair counter" in b.label)
+    reset_btn = next(b for b in at.button if "Reset repair counter" in b.label)
     reset_btn.click()
     at.run(timeout=30)
     assert at.exception == []
@@ -456,16 +519,7 @@ def test_clicking_reset_repair_counter_clears_the_tally(apptest_with_mocked_agen
     assert workflow.repair_attempts_for("stuck_file.py") == 0
 
 
-# ---------------------------------------------------------------------------
-# Phase 6: the in-chat "Approval Required" card. Unlike the sidebar's Approve
-# button (mark-approved-only, by design - see
-# test_approving_a_change_does_not_touch_conversation_or_other_state above),
-# this card's Approve button actually resumes the workflow by driving the
-# real agent through run_agent_turn again.
-# ---------------------------------------------------------------------------
-
-
-def test_chat_approve_button_resumes_the_workflow(
+def test_approve_button_resumes_the_workflow_with_full_details(
     apptest_with_mocked_agent, monkeypatch
 ):
     at = apptest_with_mocked_agent
@@ -497,10 +551,9 @@ def test_chat_approve_button_resumes_the_workflow(
     change.change_id = "abc123"
     workflow._pending_changes["abc123"] = change
 
-    at.run(timeout=30)
-    assert at.exception == []
+    at = _goto(at, "Changes")
 
-    approve_btn = next(b for b in at.button if b.key == "chat_approve_abc123")
+    approve_btn = next(b for b in at.button if b.key == "approve_abc123")
     approve_btn.click()
     at.run(timeout=30)
     assert at.exception == []
@@ -513,22 +566,3 @@ def test_chat_approve_button_resumes_the_workflow(
     assert messages[-1]["content"] == "Applied the change and all tests pass."
     assert messages[-1]["workflow_states"][-1] == "COMPLETED"
     assert messages[-2]["content"].startswith("✅ Approved change")
-
-
-def test_chat_reject_button_removes_the_pending_change(apptest_with_mocked_agent):
-    at = apptest_with_mocked_agent
-
-    change = workflow.register_change(
-        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
-    )
-    at.run(timeout=30)
-    assert at.exception == []
-
-    reject_btn = next(
-        b for b in at.button if b.key == f"chat_reject_{change.change_id}"
-    )
-    reject_btn.click()
-    at.run(timeout=30)
-    assert at.exception == []
-
-    assert workflow.get_change(change.change_id) is None

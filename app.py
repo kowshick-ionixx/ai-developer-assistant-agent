@@ -6,8 +6,16 @@ chat, taking user input, and displaying the agent's answers. All the AI logic
 lives in agent.py, and the tools live in tools.py.
 
     USER -> STREAMLIT UI -> agent.py (LangChain + Gemini) -> back to UI
+
+UI architecture (v2 - a clean, professional workspace, not a dashboard):
+a compact header, a narrow sidebar (9 nav destinations + a Phase 6 footer),
+and a single main-content column whose content is chosen by
+st.session_state.nav_view. Every value shown anywhere in this file comes
+from real session state, workflow.py's real registry, or a real (read-only,
+user-triggered) tool call - never invented.
 """
 
+import difflib
 import html
 import os
 import re
@@ -45,163 +53,126 @@ st.set_page_config(
 
 st.markdown(
     """
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- No blank lines anywhere inside this <style> block: Streamlit's
+         markdown-to-HTML pass treats a raw HTML block as ended by the
+         first blank line (CommonMark HTML-block rule), so a blank line in
+         here truncates the stylesheet mid-parse and leaks every rule after
+         it as literal page text instead of applying it as CSS - a real bug
+         found and fixed via visual (Playwright) inspection, not just a
+         style preference. Keep every rule on a contiguous, non-blank run
+         of lines; use comments (never a blank line) to separate groups. -->
     <style>
-    .block-container { padding-top: 1.5rem; }
-    .tool-box {
-        background-color: rgba(120, 120, 120, 0.08);
-        border-left: 4px solid #4CAF50;
-        border-radius: 6px;
-        padding: 0.6rem 1rem;
-        margin-bottom: 0.6rem;
-        font-size: 0.9rem;
+    :root {
+        --bg: #f7f8fa;
+        --surface: #ffffff;
+        --border: #e2e5ea;
+        --text: #16181d;
+        --text-muted: #6b7280;
+        --primary: #2563eb;
+        --primary-soft: #eaf1ff;
+        --success: #16a34a;
+        --success-soft: #eafbf1;
+        --warning: #b45309;
+        --warning-soft: #fdf3e2;
+        --error: #dc2626;
+        --error-soft: #fdecec;
     }
-
+    html, body, [class*="css"] { font-family: "Inter", -apple-system, sans-serif; }
+    code, pre, .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+    .stApp { background: var(--bg); }
+    .block-container { padding-top: 1.2rem; max-width: 1200px; }
+    section[data-testid="stSidebar"] {
+        background: var(--surface);
+        border-right: 1px solid var(--border);
+    }
     /* Chat responses are rendered from LLM-generated Markdown, which can
        contain ATX headings (#, ##, ...) copied verbatim from scraped
-       documentation/web content. Markdown headings are allowed to interrupt
-       a paragraph, so a single stray "# ..." line (e.g. a shell comment)
-       renders as a full browser-default heading and breaks typography
-       consistency. These rules clamp every heading level to one of two
-       small, bold sizes and pin body/list/code text to fixed sizes, using
-       rem/em units only (no colors) so both the light and dark themes are
-       unaffected.
-    */
+       documentation/web content - a stray "# ..." line otherwise renders
+       as a full browser-default heading. These rules clamp every heading
+       level to one of two small, bold sizes. */
     [data-testid="stChatMessage"] :is(h1, h2, h3, h4, h5, h6) {
         font-size: 1.05rem !important;
         font-weight: 700 !important;
         margin: 0.6rem 0 0.3rem !important;
         line-height: 1.4 !important;
     }
-    [data-testid="stChatMessage"] :is(h1, h2) {
-        font-size: 1.15rem !important;
-    }
+    [data-testid="stChatMessage"] :is(h1, h2) { font-size: 1.15rem !important; }
     [data-testid="stChatMessage"] p,
-    [data-testid="stChatMessage"] li {
-        font-size: 1rem !important;
-        line-height: 1.55 !important;
+    [data-testid="stChatMessage"] li { font-size: 1rem !important; line-height: 1.55 !important; }
+    [data-testid="stChatMessage"] code { font-size: 0.85em !important; }
+    /* Defensive guard: force full brightness regardless of Streamlit's
+       internal script-run state, so the page can never be left dimmed
+       during/after processing. */
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    .block-container, [data-testid="stChatMessage"] {
+        opacity: 1 !important; filter: none !important;
     }
-    [data-testid="stChatMessage"] code {
-        font-size: 0.85em !important;
+    .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 0.9rem 1.1rem;
+        margin-bottom: 0.75rem;
     }
-
-    /* Defensive guard: force full brightness on the main content area
-       regardless of Streamlit's internal script-run state or any external
-       interference (e.g. a browser extension), so the page can never be
-       left dimmed - during processing or after a response completes. */
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stMain"],
-    .block-container,
-    [data-testid="stChatMessage"] {
-        opacity: 1 !important;
-        filter: none !important;
+    .card-title {
+        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em;
+        color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.6rem;
     }
-
-    /* ---------------------------------------------------------------
-       Dashboard-style panels (Phase checklist, stats, workflow trail,
-       tool chips, diffs, terminal output, final report banner). Pure
-       presentation on top of real session data - see the render_* /
-       compute_* helpers below for what actually feeds each class.
-       --------------------------------------------------------------- */
-    section[data-testid="stSidebar"] { border-right: 1px solid #262635; }
-
-    .panel-card {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid #262635;
-        border-radius: 10px;
-        padding: 0.7rem 0.9rem;
-        margin-bottom: 0.8rem;
+    .page-title { font-size: 1.35rem; font-weight: 700; margin-bottom: 0.15rem; }
+    .page-subtitle { font-size: 0.88rem; color: var(--text-muted); margin-bottom: 1rem; }
+    .pill {
+        display: inline-flex; align-items: center; gap: 5px;
+        font-size: 0.78rem; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+        border: 1px solid var(--border);
     }
-    .panel-title {
-        font-size: 0.8rem;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        color: #9a9ab0;
-        text-transform: uppercase;
-        margin-bottom: 0.5rem;
+    .pill.success { color: var(--success); background: var(--success-soft); border-color: transparent; }
+    .pill.warning { color: var(--warning); background: var(--warning-soft); border-color: transparent; }
+    .pill.error { color: var(--error); background: var(--error-soft); border-color: transparent; }
+    .pill.neutral { color: var(--text-muted); background: var(--bg); }
+    .task-step { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 0.86rem; }
+    .task-step.done { color: var(--success); }
+    .task-step.active { color: var(--primary); font-weight: 600; }
+    .task-step.pending { color: var(--text-muted); }
+    .row-between { display: flex; justify-content: space-between; align-items: center; }
+    .kv-row {
+        display: flex; justify-content: space-between; padding: 5px 0;
+        font-size: 0.85rem; border-bottom: 1px solid var(--border);
     }
-
-    .phase-checklist { display: flex; flex-direction: column; gap: 2px; }
-    .phase-row {
-        display: flex; align-items: center; gap: 8px;
-        padding: 6px 10px; border-radius: 8px;
-        font-size: 0.85rem; color: #c9c9d6;
-    }
-    .phase-row.active {
-        background: rgba(139,92,246,0.18);
-        border: 1px solid rgba(139,92,246,0.5);
-        color: #fff; font-weight: 600;
-    }
-    .phase-check { color: #22c55e; font-weight: 700; }
-    .phase-label { color: #8a8a9c; margin-left: auto; font-size: 0.78rem; }
-    .phase-row.active .phase-label { color: #d8cbfd; }
-
-    .stat-row {
-        display: flex; justify-content: space-between;
-        padding: 4px 0; font-size: 0.85rem; color: #c9c9d6;
-        border-bottom: 1px solid rgba(255,255,255,0.05);
-    }
-    .stat-row:last-child { border-bottom: none; }
-    .stat-value { color: #fff; font-weight: 700; }
-
-    .wf-list { display: flex; flex-direction: column; gap: 2px; }
-    .wf-row { padding: 5px 10px; border-radius: 6px; font-size: 0.83rem; }
-    .wf-row.done { color: #22c55e; }
-    .wf-row.active { color: #a78bfa; background: rgba(139,92,246,0.14); font-weight: 700; }
-    .wf-row.pending { color: #62626f; }
-
-    .tool-chip-list { display: flex; flex-direction: column; gap: 4px; }
-    .tool-chip {
-        background: rgba(34,197,94,0.1);
-        border: 1px solid rgba(34,197,94,0.3);
-        color: #4ade80; padding: 4px 10px; border-radius: 6px;
-        font-size: 0.78rem;
-    }
-
-    .diff-block, .terminal-block {
-        background: #0a0a10; border: 1px solid #262635; border-radius: 8px;
-        padding: 10px; font-family: "SFMono-Regular", Consolas, monospace;
+    .kv-row:last-child { border-bottom: none; }
+    .kv-row .v { font-weight: 600; }
+    .diff-block {
+        background: #0d1117; color: #c9d1d9; border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px; font-family: "SFMono-Regular", Consolas, monospace;
         font-size: 0.78rem; white-space: pre-wrap; overflow-x: auto;
-        max-height: 340px; overflow-y: auto; margin: 0;
+        max-height: 420px; overflow-y: auto; margin: 0;
     }
-    .diff-add { color: #4ade80; display: block; }
-    .diff-del { color: #f87171; display: block; }
-    .diff-ctx { color: #9a9ab0; display: block; }
-    .terminal-block { color: #4ade80; }
-    .terminal-block.error { color: #f87171; }
-
-    .test-banner {
-        border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; font-size: 0.9rem;
+    .diff-add { color: #7ee787; display: block; }
+    .diff-del { color: #ffa198; display: block; }
+    .diff-ctx { color: #8b949e; display: block; }
+    .log-block {
+        background: #0d1117; color: #c9d1d9; border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px; font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 0.78rem; white-space: pre-wrap; overflow-x: auto;
+        max-height: 460px; overflow-y: auto; margin: 0;
     }
-    .test-banner.pass {
-        background: rgba(34,197,94,0.12); color: #4ade80;
-        border: 1px solid rgba(34,197,94,0.35);
+    .log-block.error { color: #ffa198; }
+    .shortcut-btn button {
+        height: 5.4rem; text-align: left; white-space: pre-line;
     }
-    .test-banner.fail {
-        background: rgba(239,68,68,0.12); color: #f87171;
-        border: 1px solid rgba(239,68,68,0.35);
-    }
-    .test-row { font-size: 0.82rem; padding: 2px 0; color: #c9c9d6; }
-
-    .final-report-banner {
-        margin-top: 1rem;
-        background: linear-gradient(90deg, rgba(34,197,94,0.16), rgba(34,197,94,0.04));
-        border: 1px solid rgba(34,197,94,0.4);
-        border-radius: 12px; padding: 16px 20px;
-    }
-    .final-report-title { font-size: 1.05rem; font-weight: 700; color: #4ade80; margin-bottom: 10px; }
-    .final-report-stats { display: flex; gap: 28px; flex-wrap: wrap; }
-    .final-report-stats > div { display: flex; flex-direction: column; font-size: 0.78rem; color: #9a9ab0; }
-    .final-report-stats > div b { font-size: 1rem; color: #fff; margin-top: 2px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# AI Features reference panel (sidebar): pure information about what each
-# phase can do - no example question is ever inserted into the chat input or
-# sent to the agent from here. The user always types their own question into
-# the existing chat bar; this dict only feeds read-only st.markdown() text.
+# ---------------------------------------------------------------------------
+# Static reference data
+# ---------------------------------------------------------------------------
+
+# "Capabilities" panel (sidebar, secondary): pure information about what each
+# phase can do - never inserted into the chat input or sent to the agent.
 AI_FEATURES_INFO = {
     "Phase 1 — Foundation & Basic Agent": {
         "summary": "Provides the basic AI agent foundation.",
@@ -349,10 +320,8 @@ TOOL_DISPLAY_NAMES = {
     "list_pending_changes": "🔧 Checking Pending Changes",
 }
 
-# "Execution Plan" card: a human-readable label for each tool the agent can
-# call, used to render what it actually did this turn as a checklist. This
-# is a post-hoc summary of real tool calls (see render_execution_plan) - not
-# a forecast, so every line shown already happened and is checked off.
+# "Execution Plan" list: what a turn's tool calls actually did, in order -
+# never a forecast, so every line shown already happened.
 EXECUTION_STEP_LABELS = {
     "list_project_files": "Inspect project structure",
     "search_project": "Search the project for related code",
@@ -377,48 +346,79 @@ EXECUTION_STEP_LABELS = {
     "list_pending_changes": "Check pending changes",
 }
 
-# Quick Actions: an optional prefix prepended to the message sent to the
-# agent (the chat still shows the user's original text). "Ask" sends the
-# message unchanged - the agent already understands intent on its own.
-MODE_PREFIXES = {
-    "Ask": "",
-    "Generate Code": "Generate code for the following request:\n\n",
-    "Debug Code": "Debug the following code and explain the fix:\n\n",
-    "Review Code": "Review the following code:\n\n",
-    "Refactor Code": "Refactor the following code:\n\n",
-    "Generate Tests": "Generate pytest tests for the following code:\n\n",
-}
-
-# Sidebar "AI FEATURES (PHASES)" checklist: every phase this codebase has
-# actually built (see AI_FEATURES_INFO above for the detailed reference
-# panel) is complete - CURRENT_PHASE is only which one is "active" for
-# display, not a claim that earlier phases are unfinished.
-PHASE_CHECKLIST = [
-    ("Phase 1", "Foundation & Basic Agent"),
-    ("Phase 2", "Developer Skills"),
-    ("Phase 3", "Project Understanding"),
-    ("Phase 4", "Knowledge & Git/GitHub"),
-    ("Phase 5", "Execution & Testing"),
-    ("Phase 6", "Autonomous Agent"),
+# Compact 7-step task strip (Chat page). Each step's "done" state is derived
+# only from whether a real WorkflowStatus value in that group actually
+# appeared this turn - never a fixed/forecast progression.
+_TASK_STEPS = [
+    ("Understand requirements", {"PLANNING"}),
+    ("Inspect project", {"INSPECTING", "SEARCHING_DOCUMENTATION"}),
+    ("Create implementation plan", {"PROPOSING_CHANGE"}),
+    ("Waiting for approval", {"WAITING_FOR_APPROVAL"}),
+    ("Implement", {"IMPLEMENTING"}),
+    ("Test", {"TESTING", "ANALYZING", "FIXING", "RETESTING", "REGRESSION_TESTING"}),
+    ("Review", {"REVIEWING", "COMPLETED"}),
 ]
-CURRENT_PHASE = "Phase 6"
 
-# The 10-step trail shown in the "Workflow Status" panel. Real Phase 6 turns
-# can also pass through a few states not shown as their own row here
-# (PROPOSING_CHANGE, WAITING_FOR_APPROVAL, REGRESSION_TESTING, FAILED) -
-# those are surfaced instead via the "Current State" badge above the trail,
-# never silently folded into one of these rows.
-WORKFLOW_ROWS = [
-    ("PLANNING", "PLANNING"),
-    ("INSPECTING", "INSPECTING"),
-    ("SEARCHING_DOCUMENTATION", "SEARCHING DOCS"),
-    ("IMPLEMENTING", "IMPLEMENTING"),
-    ("TESTING", "TESTING"),
-    ("ANALYZING", "ANALYZING"),
-    ("FIXING", "FIXING"),
-    ("RETESTING", "RETESTING"),
-    ("REVIEWING", "REVIEWING"),
-    ("COMPLETED", "COMPLETED"),
+# Home page shortcuts: real prompts sent through the real agent pipeline
+# (see _handle_home_shortcut) - never a fake/simulated action.
+HOME_SHORTCUTS = [
+    (
+        "Understand Project",
+        "Analyze my codebase",
+        (
+            "Give me an overview of this project's architecture and how the "
+            "main files work together."
+        ),
+    ),
+    (
+        "Review Code",
+        "Find bugs and issues",
+        (
+            "Review this project's code for bugs, security issues, and "
+            "readability problems."
+        ),
+    ),
+    (
+        "Build Feature",
+        "Plan and implement",
+        (
+            "I want to add a new feature to this project. Inspect the project "
+            "first, then propose an implementation plan."
+        ),
+    ),
+    (
+        "Run Tests",
+        "Test and analyze",
+        "Run the full test suite and analyze the results.",
+    ),
+]
+
+# Common tech-stack keywords scanned for in an attached document's real
+# extracted text (Documents page). A literal, honest keyword match only -
+# never an inferred/guessed requirement for a concept that isn't a keyword.
+_REQUIREMENT_KEYWORDS = [
+    "FastAPI",
+    "Flask",
+    "Django",
+    "SQLite",
+    "PostgreSQL",
+    "MySQL",
+    "SQLAlchemy",
+    "Pydantic",
+    "pytest",
+    "Ruff",
+    "Black",
+    "Docker",
+    "REST API",
+    "JWT",
+    "OAuth",
+    "authentication",
+    "authorization",
+    "validation",
+    "README",
+    "CI/CD",
+    "unit test",
+    "integration test",
 ]
 
 _LANGUAGE_BY_EXTENSION = {
@@ -437,6 +437,23 @@ _LANGUAGE_BY_EXTENSION = {
     "toml": "toml",
 }
 
+NAV_ITEMS = [
+    "Home",
+    "Chat",
+    "Project",
+    "Documents",
+    "Changes",
+    "Tests",
+    "Git",
+    "Logs",
+    "Settings",
+]
+
+
+# ---------------------------------------------------------------------------
+# Rendering / formatting helpers
+# ---------------------------------------------------------------------------
+
 
 def _output_block(text: str, limit: int = 2000) -> str:
     """Render tool output as safely-escaped, pre-formatted HTML."""
@@ -448,18 +465,13 @@ def _output_block(text: str, limit: int = 2000) -> str:
 
 # Matches a *complete* ```lang\n...\n``` fenced code block. Only fully
 # paired fences are matched - a stray/unclosed ``` is left as plain text
-# instead of being treated as an (empty) code block, which is what was
-# producing the large empty dark boxes: Markdown's own fence auto-detection
-# has no way to tell "malformed fence" from "intentional empty code block".
+# instead of being treated as an (empty) code block.
 _CODE_FENCE_RE = re.compile(r"```([a-zA-Z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 
 
 def render_answer(text: str) -> None:
     """Render assistant answer text, drawing fenced code blocks with
-    st.code() (guaranteed monospace font + syntax highlighting) instead of
-    relying on Markdown's automatic fence detection, and skipping any code
-    fence or text segment that has no actual content.
-    """
+    st.code() instead of relying on Markdown's automatic fence detection."""
     text = text or ""
     pos = 0
     rendered_anything = False
@@ -493,9 +505,8 @@ def _js_string_literal(text: str) -> str:
 
 
 def render_tts_button(text: str, key: str) -> None:
-    """Optional 'read aloud' button: uses the browser's own built-in
-    speechSynthesis (Web Speech API) client-side - no server-side TTS
-    service, API key, or extra dependency involved."""
+    """Optional 'read aloud' button: the browser's own speechSynthesis
+    (Web Speech API) client-side - no server-side TTS service/dependency."""
     if st.button("🔊 Read aloud", key=key):
         components.html(
             f"""
@@ -510,35 +521,30 @@ def render_tts_button(text: str, key: str) -> None:
 
 
 def render_workflow_states(states: list[str]) -> None:
-    """Show the Phase 6 workflow-status trail for one turn (e.g.
-    'Workflow: IMPLEMENTING -> WAITING FOR APPROVAL'), derived from which
-    tools were actually called - purely descriptive, shown only when at
-    least one Phase 6-relevant tool ran this turn."""
+    """A one-line 'Workflow: A -> B' caption for one turn, derived only
+    from tools actually called - shown only when Phase 6 was engaged."""
     if not states:
         return
     trail = " → ".join(state.replace("_", " ") for state in states)
-    st.caption(f"🔧 Workflow: {trail}")
+    st.caption(f"Workflow: {trail}")
 
 
 def render_execution_plan(tool_calls: list[dict]) -> None:
-    """'Execution Plan' checklist: what this turn's tool calls actually did,
-    in the order they really happened - never a forecast of future steps, so
-    every line is already checked off (it already ran). Shown only when the
-    turn actually called at least one tool."""
+    """What this turn's tool calls actually did, in the order they really
+    happened - never a forecast, so every line is already checked off."""
     if not tool_calls:
         return
     steps = [
         EXECUTION_STEP_LABELS.get(tool_call["name"], tool_call["name"])
         for tool_call in tool_calls
     ]
-    with st.container(border=True):
-        st.markdown("**📋 Execution Plan**")
+    with st.expander("Steps taken this turn", expanded=False):
         for index, step in enumerate(steps, start=1):
-            st.markdown(f"{index}. {html.escape(step)} ✅")
+            st.markdown(f"{index}. {html.escape(step)} ✓")
 
 
 def render_tool_box(tool_call: dict) -> None:
-    """Render a single '🔧 Using X Tool' box for one tool call."""
+    """Render a single 'Using X' note for one tool call."""
     name = tool_call["name"]
     header = TOOL_DISPLAY_NAMES.get(name, f"🔧 Using {name}")
 
@@ -560,7 +566,9 @@ def render_tool_box(tool_call: dict) -> None:
         body = _output_block(tool_call["output"])
 
     st.markdown(
-        f'<div class="tool-box"><b>{header}</b><br>{body}</div>', unsafe_allow_html=True
+        f'<div class="card" style="border-left:3px solid var(--primary);">'
+        f"<b>{header}</b><br>{body}</div>",
+        unsafe_allow_html=True,
     )
 
 
@@ -578,10 +586,9 @@ def _run_and_render_turn(
     record it in session state exactly like a normal typed chat turn.
 
     `displayed_text` is what the chat bubble shows the user (may differ from
-    `agent_input`, e.g. an approval nudge the agent needs but the user didn't
-    literally type) - shared by the main chat_input handler below and by
-    _approve_and_resume(), so "typing a message" and "clicking Approve" both
-    go through this one real turn-runner instead of duplicating it.
+    `agent_input`, e.g. an approval nudge or a Home-page shortcut prompt) -
+    shared by every real turn trigger in this file (typed input, a Home
+    shortcut, or an Approve click) so none of them duplicate this logic.
     """
     st.session_state.messages.append(
         {"role": "user", "content": displayed_text, "tool_calls": [], "source": source}
@@ -590,7 +597,7 @@ def _run_and_render_turn(
 
     with st.chat_message("user"):
         if source == "voice":
-            st.caption("🎤 Voice input · 📝 Transcribed")
+            st.caption("🎤 Voice input · transcribed")
         st.markdown(displayed_text)
 
     with st.chat_message("assistant"):
@@ -629,14 +636,12 @@ def _run_and_render_turn(
 
 
 def _approve_and_resume(agent, change: workflow.ProposedChange) -> None:
-    """Approve a proposed change via the real Phase 6 approval registry
-    (workflow.approve_change - the exact function the sidebar's own Approve
-    button already calls), then drive the SAME agent through
+    """Approve one change via the real Phase 6 approval registry
+    (workflow.approve_change), then drive the SAME agent through
     run_agent_turn's existing bounded auto-continuation loop to actually
     apply it, run the tests, and fix/retest within the existing
-    repair-attempt limit - i.e. exactly what typing "apply it" would already
-    do, just triggered automatically instead of requiring that follow-up
-    message."""
+    repair-attempt limit - exactly what typing "apply it" would already do,
+    triggered automatically instead of requiring that follow-up message."""
     workflow.approve_change(change.change_id)
     nudge = (
         f"The user has approved change '{change.change_id}' "
@@ -655,19 +660,11 @@ def _approve_and_resume(agent, change: workflow.ProposedChange) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dashboard data helpers - every panel below reads ONLY real session data:
-# messages already produced this session (st.session_state.messages, each
-# carrying the tool_calls/workflow_states that turn actually produced) and
-# workflow.py's real pending/applied-change registry. Nothing here invents
-# numbers that weren't actually observed.
+# Data helpers - every panel in this file reads ONLY real session data:
+# messages already produced this session (each carrying the tool_calls/
+# workflow_states that turn actually produced) and workflow.py's real
+# pending/applied-change registry. Nothing here invents a number.
 # ---------------------------------------------------------------------------
-
-
-def _last_assistant_message() -> dict | None:
-    for message in reversed(st.session_state.messages):
-        if message["role"] == "assistant":
-            return message
-    return None
 
 
 def _find_tool_calls(messages: list[dict], name: str) -> list[dict]:
@@ -683,8 +680,8 @@ def _find_tool_calls(messages: list[dict], name: str) -> list[dict]:
 def _applied_changes_this_session() -> list[workflow.ProposedChange]:
     """Changes actually written to disk this session, resolved from the
     real change registry (workflow.get_change keeps a change reachable by
-    id even after it's been applied - only list_pending_changes() filters
-    those out, since that list is for the *pending* approval queue)."""
+    id even after it's applied - only list_pending_changes() filters those
+    out, since that list is for the *pending* approval queue)."""
     seen_ids: set[str] = set()
     applied: list[workflow.ProposedChange] = []
     for tool_call in _find_tool_calls(
@@ -706,21 +703,30 @@ def _guess_language(file_path: str) -> str | None:
     return _LANGUAGE_BY_EXTENSION.get(file_path.rsplit(".", 1)[-1].lower())
 
 
-@st.cache_data(show_spinner=False)
-def _get_repo_url() -> str | None:
-    """This project's real Git remote URL (read-only), for the header's
-    GitHub link - None if it isn't a Git repo or has no remote configured,
-    never a fabricated link."""
-    try:
-        repo = tools._get_repo()
-        if repo is None or not repo.remotes:
-            return None
-        url = repo.remotes[0].url
-    except Exception:  # noqa: BLE001 - decorative UI chrome must never crash the page
-        return None
-    if url.startswith("git@github.com:"):
-        url = "https://github.com/" + url[len("git@github.com:") :]
-    return url.removesuffix(".git")
+def _unified_diff(old_text: str, new_text: str, file_path: str) -> str:
+    """A real diff (Python's stdlib difflib) between the actual on-disk
+    content and a proposed change's content - computed here, in the UI,
+    from real text on both sides; never a fabricated/simulated diff."""
+    diff_lines = difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+        lineterm="",
+    )
+    return "\n".join(diff_lines)
+
+
+def _diff_to_html(diff_text: str) -> str:
+    rendered_lines = []
+    for line in html.escape(diff_text).splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            rendered_lines.append(f'<span class="diff-add">{line}</span>')
+        elif line.startswith("-") and not line.startswith("---"):
+            rendered_lines.append(f'<span class="diff-del">{line}</span>')
+        else:
+            rendered_lines.append(f'<span class="diff-ctx">{line}</span>')
+    return '<pre class="diff-block">' + "\n".join(rendered_lines) + "</pre>"
 
 
 _PYTEST_TEST_LINE_RE = re.compile(
@@ -733,8 +739,8 @@ _PYTEST_EXIT_CODE_RE = re.compile(r"^Exit code:\s*(\d+)")
 
 def _parse_pytest_output(output: str) -> dict:
     """Pull real counts/durations/per-test results out of run_pytest's own
-    output (see tools.py's run_pytest: "Exit code: N\\n\\n<pytest -v output>").
-    Never guesses a number it can't find - missing fields stay 0/None."""
+    output. Never guesses a number it can't find - missing fields stay
+    0/None."""
     output = str(output)
     counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0}
     for number, label in _PYTEST_SUMMARY_COUNT_RE.findall(output):
@@ -758,362 +764,54 @@ def _parse_pytest_output(output: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Sidebar panel renderers
-# ---------------------------------------------------------------------------
-
-
-def render_phase_checklist() -> None:
-    rows = []
-    for phase, label in PHASE_CHECKLIST:
-        active = phase == CURRENT_PHASE
-        row_class = "phase-row active" if active else "phase-row"
-        rows.append(
-            f'<div class="{row_class}"><span class="phase-check">✓</span>'
-            f"<span>{html.escape(phase)}</span>"
-            f'<span class="phase-label">{html.escape(label)}</span></div>'
-        )
-    st.markdown(
-        '<div class="panel-card"><div class="panel-title">AI Features (Phases)</div>'
-        f'<div class="phase-checklist">{"".join(rows)}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def _compute_agent_stats() -> dict:
+def _current_task() -> dict | None:
+    """The active development task, if one exists this session: the human
+    text that most recently produced real workflow_states, plus the real
+    states from that turn's assistant reply. None if no Phase 6 workflow
+    has been engaged yet - never a placeholder task."""
     messages = st.session_state.messages
-    tasks_completed = sum(1 for message in messages if message["role"] == "assistant")
-    files_modified = len(
-        {change.file_path for change in _applied_changes_this_session()}
-    )
-
-    pytest_calls = _find_tool_calls(messages, "run_pytest")
-    tests_run = 0
-    passing_runs = 0
-    for tool_call in pytest_calls:
-        parsed = _parse_pytest_output(tool_call["output"])
-        tests_run += parsed["total"]
-        if parsed["exit_code"] == 0:
-            passing_runs += 1
-    success_rate = (
-        f"{round(passing_runs / len(pytest_calls) * 100)}%" if pytest_calls else "—"
-    )
-
-    last_assistant = _last_assistant_message()
-    last_states = last_assistant.get("workflow_states", []) if last_assistant else []
-    active_workflow = (
-        1 if last_states and last_states[-1] not in ("COMPLETED", "FAILED") else 0
-    )
-
-    return {
-        "Tasks Completed": tasks_completed,
-        "Files Modified": files_modified,
-        "Tests Run": tests_run,
-        "Success Rate": success_rate,
-        "Active Workflow": active_workflow,
-    }
-
-
-def render_agent_stats() -> None:
-    rows = "".join(
-        f'<div class="stat-row"><span>{html.escape(label)}</span>'
-        f'<span class="stat-value">{html.escape(str(value))}</span></div>'
-        for label, value in _compute_agent_stats().items()
-    )
-    st.markdown(
-        f'<div class="panel-card"><div class="panel-title">Agent Stats</div>{rows}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_session_info() -> None:
-    rows_data = {
-        "Session ID": st.session_state.session_id,
-        "Started At": st.session_state.started_at.strftime("%H:%M"),
-        "Model": get_model_name(),
-        "Temperature": AGENT_TEMPERATURE,
-    }
-    rows = "".join(
-        f'<div class="stat-row"><span>{html.escape(label)}</span>'
-        f'<span class="stat-value">{html.escape(str(value))}</span></div>'
-        for label, value in rows_data.items()
-    )
-    st.markdown(
-        f'<div class="panel-card"><div class="panel-title">Session Info</div>{rows}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Workflow status / tools-used / file-changes / test-results panel renderers
-# (the right-hand dashboard column)
-# ---------------------------------------------------------------------------
-
-
-def render_workflow_status_panel() -> None:
-    last_assistant = _last_assistant_message()
-    states = last_assistant.get("workflow_states", []) if last_assistant else []
-    current_state = states[-1] if states else "IDLE"
-    badge_color = {
-        "COMPLETED": "green",
-        "FAILED": "red",
-        "WAITING_FOR_APPROVAL": "orange",
-    }.get(current_state, "violet" if states else "gray")
-
-    st.markdown("**🧭 Workflow Status**")
-    st.badge(f"Current State: {current_state}", color=badge_color)
-
-    in_progress = (
-        states[-1] if states and states[-1] not in ("COMPLETED", "FAILED") else None
-    )
-    rows = []
-    for state, label in WORKFLOW_ROWS:
-        if state == in_progress:
-            icon, row_class = "🔵", "wf-row active"
-        elif state in states:
-            icon, row_class = "✅", "wf-row done"
-        else:
-            icon, row_class = "⚪", "wf-row pending"
-        rows.append(f'<div class="{row_class}">{icon} {html.escape(label)}</div>')
-    st.markdown(f'<div class="wf-list">{"".join(rows)}</div>', unsafe_allow_html=True)
-
-
-def render_tools_used_panel() -> None:
-    last_assistant = _last_assistant_message()
-    tool_calls = last_assistant.get("tool_calls", []) if last_assistant else []
-    seen_names: list[str] = []
-    for tool_call in tool_calls:
-        if tool_call["name"] not in seen_names:
-            seen_names.append(tool_call["name"])
-
-    st.markdown("**🧰 Tools Used**")
-    if not seen_names:
-        st.caption("No tools used in the latest turn yet.")
-        return
-    chips = "".join(
-        f'<div class="tool-chip">✅ {html.escape(TOOL_DISPLAY_NAMES.get(name, name))}</div>'
-        for name in seen_names
-    )
-    st.markdown(f'<div class="tool-chip-list">{chips}</div>', unsafe_allow_html=True)
-
-
-def render_file_changes_tab() -> None:
-    pending = workflow.list_pending_changes()
-    applied = _applied_changes_this_session()
-    if not pending and not applied:
-        st.caption(
-            "No file changes yet. Ask the AI to add, fix, or refactor something."
-        )
-        return
-
-    for change in pending:
-        tag = "new" if change.action == "create" else "modified"
-        line_count = change.content.count("\n") + 1
-        st.markdown(
-            f"**{html.escape(change.file_path)}** _({tag})_ · +{line_count} lines · "
-            "⏳ pending your approval in the sidebar"
-        )
-        st.code(change.content, language=_guess_language(change.file_path))
-
-    for change in applied:
-        tag = "new" if change.action == "create" else "modified"
-        line_count = change.content.count("\n") + 1
-        st.markdown(
-            f"**{html.escape(change.file_path)}** _({tag})_ · +{line_count} lines · ✅ applied"
-        )
-        st.code(change.content, language=_guess_language(change.file_path))
-
-
-def _diff_to_html(diff_text: str) -> str:
-    rendered_lines = []
-    for line in html.escape(diff_text).splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            rendered_lines.append(f'<span class="diff-add">{line}</span>')
-        elif line.startswith("-") and not line.startswith("---"):
-            rendered_lines.append(f'<span class="diff-del">{line}</span>')
-        else:
-            rendered_lines.append(f'<span class="diff-ctx">{line}</span>')
-    return '<pre class="diff-block">' + "\n".join(rendered_lines) + "</pre>"
-
-
-def render_git_diff_tab() -> None:
-    if st.button("🔄 Refresh Git Diff", key="refresh_git_diff"):
-        try:
-            st.session_state.git_diff_cache = tools.git_diff.invoke({})
-        except Exception as exc:  # noqa: BLE001 - never crash the UI
-            log_error("git_diff_ui", exc)
-            st.session_state.git_diff_cache = "⚠️ Could not read the Git diff."
-
-    cached = st.session_state.get("git_diff_cache")
-    if cached is None:
-        st.caption("Click Refresh to view uncommitted changes in the working tree.")
-        return
-    st.markdown(_diff_to_html(cached), unsafe_allow_html=True)
-
-
-def render_project_explorer_tab() -> None:
-    if st.button("🔄 Refresh Project Files", key="refresh_project_files"):
-        try:
-            st.session_state.project_tree_cache = tools.list_project_files.invoke({})
-        except Exception as exc:  # noqa: BLE001
-            log_error("list_project_files_ui", exc)
-            st.session_state.project_tree_cache = (
-                "⚠️ Could not read the project structure."
-            )
-
-    cached = st.session_state.get("project_tree_cache")
-    if cached is None:
-        st.caption("Click Refresh to view the project's real file tree.")
-        return
-    st.code(cached, language=None)
-
-
-def render_test_results_panel() -> None:
-    pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
-    st.markdown("**🧪 Test Results**")
-    if not pytest_calls:
-        st.caption("No tests run yet. Ask the AI to run the test suite.")
-        return
-
-    parsed = _parse_pytest_output(pytest_calls[-1]["output"])
-    counts = parsed["counts"]
-    all_passed = parsed["exit_code"] == 0
-    banner_class = "test-banner pass" if all_passed else "test-banner fail"
-    banner_text = "✅ ALL TESTS PASSED" if all_passed else "❌ TESTS FAILED"
-    duration_text = (
-        f"{parsed['duration']}s" if parsed["duration"] is not None else "unknown time"
-    )
-    st.markdown(
-        f'<div class="{banner_class}"><b>{banner_text}</b><br>'
-        f"{parsed['total']} total in {duration_text}</div>",
-        unsafe_allow_html=True,
-    )
-
-    total_col, passed_col, failed_col, skipped_col = st.columns(4)
-    total_col.metric("Total", parsed["total"])
-    passed_col.metric("Passed", counts["passed"])
-    failed_col.metric("Failed", counts["failed"])
-    skipped_col.metric("Skipped", counts["skipped"])
-
-    if parsed["tests"]:
-        st.caption("Recent tests")
-        status_icons = {"PASSED": "✅", "SKIPPED": "⏭️", "FAILED": "❌", "ERROR": "❌"}
-        for test in parsed["tests"][:10]:
-            icon = status_icons.get(test["status"], "•")
-            st.markdown(
-                f'<div class="test-row">{icon} {html.escape(test["name"])}</div>',
-                unsafe_allow_html=True,
-            )
-        remaining = len(parsed["tests"]) - 10
-        if remaining > 0:
-            st.caption(f"...and {remaining} more")
-
-
-def render_execution_tabs() -> None:
-    output_tab, error_tab, log_tab = st.tabs(["🖥 Output", "🩺 Errors", "📜 Logs"])
-    pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
-
-    with output_tab:
-        if pytest_calls:
-            latest_output = str(pytest_calls[-1]["output"])[:4000]
-            st.markdown(
-                f'<pre class="terminal-block">{html.escape(latest_output)}</pre>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.caption("No execution output yet - ask the AI to run the tests.")
-
-    with error_tab:
-        repair_attempts = workflow.repair_attempts_snapshot()
-        if repair_attempts:
-            st.caption("Repair attempts (real-time from the Phase 6 circuit breaker):")
-            for file_path, count in repair_attempts.items():
-                st.markdown(
-                    f"• `{file_path}` — {count} / {workflow.MAX_REPAIR_ATTEMPTS}"
-                )
-
-        latest_failure = None
-        for tool_call in reversed(pytest_calls):
-            if _parse_pytest_output(tool_call["output"])["exit_code"] not in (0, None):
-                latest_failure = tool_call
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message["role"] != "assistant" or not message.get("workflow_states"):
+            continue
+        task_text = None
+        for earlier in reversed(messages[:index]):
+            if earlier["role"] == "user":
+                task_text = earlier["content"]
                 break
-        if latest_failure:
-            failed_tests = [
-                test
-                for test in _parse_pytest_output(latest_failure["output"])["tests"]
-                if test["status"] in ("FAILED", "ERROR")
-            ]
-            if failed_tests:
-                st.markdown("**Failed tests:**")
-                for test in failed_tests:
-                    st.markdown(f"• ❌ `{html.escape(test['name'])}`")
-            failure_output = str(latest_failure["output"])[:4000]
-            st.markdown(
-                f'<pre class="terminal-block error">{html.escape(failure_output)}</pre>',
-                unsafe_allow_html=True,
-            )
-        elif not repair_attempts:
-            st.caption("No errors detected in the latest test run.")
+        return {
+            "task": task_text or "Development task",
+            "states": message["workflow_states"],
+        }
+    return None
 
-    with log_tab:
-        events = get_recent_events(limit=200)
-        if events:
-            lines = [
-                f"[{event['time']}] [{event['label']}] {event['text']}"
-                for event in events
-            ]
-            body = html.escape("\n".join(lines))
-            st.markdown(
-                f'<pre class="terminal-block">{body}</pre>', unsafe_allow_html=True
-            )
+
+def _task_progress(states: list[str]) -> list[tuple[str, str]]:
+    """Map real workflow_states onto the compact 7-step task strip.
+    Returns (label, status) where status is 'done'/'active'/'pending'."""
+    state_set = set(states)
+    current = states[-1] if states else None
+    rows = []
+    for label, group in _TASK_STEPS:
+        if current in group:
+            status = "active"
+        elif state_set & group:
+            status = "done"
         else:
-            st.caption("No activity logged yet this session.")
+            status = "pending"
+        rows.append((label, status))
+    return rows
 
 
-def render_final_report_banner() -> None:
-    last_assistant = _last_assistant_message()
-    if not last_assistant or "COMPLETED" not in last_assistant.get(
-        "workflow_states", []
-    ):
-        return
-
-    tool_calls = last_assistant.get("tool_calls", [])
-    created = modified = 0
-    for tool_call in tool_calls:
-        if tool_call["name"] != "apply_approved_change":
-            continue
-        change = workflow.get_change(tool_call["input"].get("change_id", ""))
-        if change is None:
-            continue
-        if change.action == "create":
-            created += 1
-        else:
-            modified += 1
-
-    pytest_calls = [tc for tc in tool_calls if tc["name"] == "run_pytest"]
-    if pytest_calls:
-        parsed = _parse_pytest_output(pytest_calls[-1]["output"])
-        tests_text = (
-            f"{parsed['counts']['passed']} passed, {parsed['counts']['failed']} failed"
-        )
-    else:
-        tests_text = "—"
-
-    duration = last_assistant.get("duration_seconds")
-    duration_text = f"{duration:.0f}s" if duration is not None else "—"
-
-    st.markdown(
-        '<div class="final-report-banner">'
-        '<div class="final-report-title">🎉 Task Completed Successfully!</div>'
-        '<div class="final-report-stats">'
-        f"<div><span>Files Changed</span><b>{created + modified} "
-        f"({created} new, {modified} modified)</b></div>"
-        f"<div><span>Tests</span><b>{html.escape(tests_text)}</b></div>"
-        f"<div><span>Time Taken</span><b>{duration_text}</b></div>"
-        "<div><span>Status</span><b>COMPLETED</b></div>"
-        "</div></div>",
-        unsafe_allow_html=True,
-    )
+def _request_nav_change(page: str) -> None:
+    """Switch pages from a button click anywhere outside the sidebar's own
+    radio widget. Streamlit forbids writing st.session_state.nav_view
+    directly once that widget has rendered in this run, so this stashes the
+    request in a plain (non-widget) key that the sidebar consumes on the
+    NEXT run, right before it re-creates the radio - the same handoff
+    pattern already used for pending_prompt."""
+    st.session_state._nav_request = page
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1142,188 +840,107 @@ if "started_at" not in st.session_state:
     st.session_state.started_at = datetime.now().astimezone()
 
 if "nav_view" not in st.session_state:
-    st.session_state.nav_view = "💬 Chat"
+    st.session_state.nav_view = "Chat"  # Chat is the primary page
+
+if "_nav_request" not in st.session_state:
+    st.session_state._nav_request = None
+
+if "git_diff_cache" not in st.session_state:
+    st.session_state.git_diff_cache = None
+
+if "git_status_cache" not in st.session_state:
+    st.session_state.git_status_cache = None
+
+if "git_branch_cache" not in st.session_state:
+    st.session_state.git_branch_cache = None
+
+if "project_tree_cache" not in st.session_state:
+    st.session_state.project_tree_cache = None
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar - narrow, clean: title, 9 nav destinations, Phase 6 footer.
+# Phase 1-6 detail lives in a secondary, collapsed "Capabilities" expander,
+# never as the primary navigation.
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("# 🤖 AI Developer Assistant")
-    st.caption("Your AI coding companion.")
-
-    render_phase_checklist()
-
-    st.markdown("## 🧭 Navigation")
-    st.radio(
-        "Navigation",
-        ["💬 Chat", "📁 Project Explorer", "🧪 Test Results", "🛠 Tools", "⚙ Settings"],
-        key="nav_view",
-        label_visibility="collapsed",
-    )
-
-    st.divider()
-    st.markdown("## 🎯 Quick Actions")
-    mode = st.selectbox(
-        "Mode",
-        list(MODE_PREFIXES.keys()),
-        key="mode_select",
-        label_visibility="collapsed",
-        help="Choose what kind of help you need, then describe or paste your code below.",
-    )
-
-    st.divider()
-    st.markdown("## 📎 Attached Files")
-    if st.session_state.attached_files:
-        for attached in st.session_state.attached_files:
-            note = " _(truncated for context)_" if attached.get("truncated") else ""
-            st.markdown(
-                f"✓ **{attached['filename']}**  \n"
-                f"{attached['file_type']} · {documents.format_size(attached['file_size'])}{note}"
-            )
-        if st.button("🗑 Clear Attachments", use_container_width=True):
-            st.session_state.attached_files = []
-            st.rerun()
-    else:
-        st.caption(
-            "No files attached. Use the 📎 icon in the chat box below to attach one."
-        )
-
-    st.divider()
-    st.markdown("## 🔧 Pending Approvals")
-    st.caption(
-        "Phase 6: file changes the AI has proposed. Nothing is written to "
-        "disk until you approve it here."
-    )
-    pending_changes = workflow.list_pending_changes()
-    if pending_changes:
-        for change in pending_changes:
-            risk_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
-                change.risk, "🟡"
-            )
-            with st.expander(
-                f"{risk_icon} {change.action} · {change.file_path} "
-                f"(id: {change.change_id})"
-            ):
-                st.markdown(f"**Reason:** {change.reason}")
-                st.markdown(f"**Risk:** {change.risk}")
-                st.code(change.content, language="python")
-                approve_col, reject_col = st.columns(2)
-                with approve_col:
-                    if st.button(
-                        "✅ Approve",
-                        key=f"approve_{change.change_id}",
-                        use_container_width=True,
-                    ):
-                        workflow.approve_change(change.change_id)
-                        st.rerun()
-                with reject_col:
-                    if st.button(
-                        "❌ Reject",
-                        key=f"reject_{change.change_id}",
-                        use_container_width=True,
-                    ):
-                        workflow.reject_change(change.change_id)
-                        st.rerun()
-                if change.approved:
-                    st.success(
-                        "Approved - ask the assistant to apply it "
-                        f"(change id `{change.change_id}`)."
-                    )
-    else:
-        st.caption(
-            "No pending changes. Ask the AI to add/fix/refactor something to see one here."
-        )
-
-    stuck_files = [
-        file_path
-        for file_path, count in workflow.repair_attempts_snapshot().items()
-        if count >= workflow.MAX_REPAIR_ATTEMPTS
-    ]
-    if stuck_files:
-        st.warning(
-            "🛑 Repair-attempt limit reached for: "
-            + ", ".join(f"`{f}`" for f in stuck_files)
-            + ". The AI can no longer apply further automatic fixes to these files "
-            "until you reset the counter below."
-        )
-        if st.button("🔄 Reset repair counter", use_container_width=True):
-            workflow.reset_repair_attempts()
-            st.rerun()
-
-    st.divider()
-    st.markdown("## 🤖 AI Features")
-    st.caption(
-        "Reference only - browse what each phase can do, then type your own "
-        "question in the chat box below. Nothing here sends or runs anything."
-    )
-    for phase_name, info in AI_FEATURES_INFO.items():
-        with st.expander(phase_name):
-            st.markdown(info["summary"])
-            st.markdown("\n".join(f"- {feature}" for feature in info["features"]))
-            st.markdown(f"**Example capability:** _{info['example']}_")
-
-    st.divider()
-    render_agent_stats()
-    render_session_info()
-
-    st.divider()
-    if st.button("🗑 Clear Conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.lc_history = []
-        st.session_state.pending_prompt = None
-        clear_events()
-        st.rerun()
-
-# ---------------------------------------------------------------------------
-# Main header
-# ---------------------------------------------------------------------------
-
-st.markdown(
-    '<div style="font-size:1.9rem;font-weight:800;white-space:nowrap;line-height:1.2;">'
-    "🤖 AI Developer Assistant Agent</div>"
-    '<div style="font-size:0.85rem;color:#9a9ab0;margin-top:2px;">'
-    "Advanced Autonomous Software Developer Agent</div>",
-    unsafe_allow_html=True,
-)
-(
-    phase_col,
-    active_col,
-    _spacer_col,
-    voice_col,
-    upload_col,
-    github_col,
-    profile_col,
-) = st.columns([1, 2, 5, 1, 1, 1, 0.6], vertical_alignment="center")
-with phase_col:
-    st.badge(CURRENT_PHASE, color="violet")
-with active_col:
-    st.badge("Agent Status: Active", icon="🟢", color="green")
-with voice_col, st.popover("🎙️"):
-    st.caption(
-        "Use the microphone icon inside the chat box below to record "
-        "a voice question."
-    )
-with upload_col, st.popover("📎"):
-    st.caption(
-        "Use the 📎 icon inside the chat box below to attach a "
-        "document (code, text, PDF, or DOCX)."
-    )
-with github_col:
-    repo_url = _get_repo_url()
-    if repo_url:
-        st.link_button("🐙", repo_url, help="Open this project's Git remote")
-    else:
-        st.button("🐙", disabled=True, help="No Git remote configured")
-with profile_col:
     st.markdown(
-        '<div style="text-align:center;font-size:1.4rem;" '
-        'title="Local single-user session">🧑‍💻</div>',
+        '<div style="font-weight:700;font-size:1.05rem;">AI Developer Assistant</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Your AI coding companion")
+    st.write("")
+
+    # A page switch requested by a button click elsewhere (Review changes,
+    # the header settings icon, a Home shortcut) is handed off via
+    # _nav_request and consumed HERE, before the radio widget below is
+    # instantiated - Streamlit forbids writing to a widget-bound
+    # session_state key (nav_view) after that widget has already rendered
+    # in the same run, so those click handlers never write nav_view
+    # directly (see _request_nav_change()).
+    if st.session_state._nav_request is not None:
+        st.session_state.nav_view = st.session_state._nav_request
+        st.session_state._nav_request = None
+
+    st.radio("Navigate", NAV_ITEMS, key="nav_view", label_visibility="collapsed")
+
+    st.write("")
+    with st.expander("Capabilities"):
+        st.caption(
+            "Reference only - browse what each phase can do, then use the "
+            "app normally. Nothing here sends or runs anything."
+        )
+        for phase_name, info in AI_FEATURES_INFO.items():
+            with st.expander(phase_name):
+                st.markdown(info["summary"])
+                st.markdown("\n".join(f"- {feature}" for feature in info["features"]))
+                st.markdown(f"**Example capability:** _{info['example']}_")
+
+    if st.session_state.attached_files:
+        st.write("")
+        st.caption(f"{len(st.session_state.attached_files)} document(s) attached")
+
+    pending_count = len(workflow.list_pending_changes())
+    if pending_count:
+        st.write("")
+        st.warning(f"{pending_count} change(s) awaiting your review")
+        if st.button("Review changes", use_container_width=True):
+            _request_nav_change("Changes")
+
+    st.markdown(
+        '<div style="position:sticky;bottom:0;padding-top:1rem;">'
+        '<div style="font-size:0.72rem;color:var(--text-muted);'
+        'text-transform:uppercase;letter-spacing:0.03em;">Phase 6</div>'
+        '<div style="font-size:0.85rem;font-weight:600;">Autonomous Developer Agent</div>'
+        "</div>",
         unsafe_allow_html=True,
     )
 
-st.caption("Ask, generate, debug, review, refactor, and test your code.")
+
+# ---------------------------------------------------------------------------
+# Header - compact, single row.
+# ---------------------------------------------------------------------------
+
+header_left, header_right = st.columns([5, 1], vertical_alignment="center")
+with header_left:
+    st.markdown(
+        '<div style="font-size:1.4rem;font-weight:700;">AI Developer Assistant</div>'
+        '<div style="font-size:0.85rem;color:var(--text-muted);">'
+        "Your AI-powered software development assistant</div>",
+        unsafe_allow_html=True,
+    )
+with header_right:
+    status_col, settings_col = st.columns([2, 1], vertical_alignment="center")
+    with status_col:
+        st.markdown(
+            '<div class="pill success" style="justify-content:center;">● Online</div>',
+            unsafe_allow_html=True,
+        )
+    with settings_col:
+        if st.button("⚙", key="header_settings", help="Settings"):
+            _request_nav_change("Settings")
+
 st.divider()
 
 # ---------------------------------------------------------------------------
@@ -1353,256 +970,658 @@ except Exception as exc:  # noqa: BLE001 - surfaced as a friendly message below
     )
     st.stop()
 
+
 # ---------------------------------------------------------------------------
-# Main dashboard layout: chat/workflow on the left, live status panels
-# (workflow trail, tools used, file changes, test results, execution output)
-# on the right - all fed by real session data via the helpers above.
+# Home page
 # ---------------------------------------------------------------------------
 
-if st.session_state.nav_view == "💬 Chat":
-    chat_col, status_col = st.columns([1.7, 1.4], gap="large")
 
-    with chat_col:
-        st.markdown("#### 💬 Chat & Workflow")
+def _handle_home_shortcut(prompt_text: str) -> None:
+    """A Home shortcut sends a real prompt through the same pipeline as
+    typing it in Chat - reuses the existing pending_prompt handoff so the
+    Chat page picks it up and answers on the very next run."""
+    st.session_state.pending_prompt = prompt_text
+    st.session_state.pending_input_source = None
+    _request_nav_change("Chat")
 
-        if not st.session_state.messages:
-            st.markdown("### 👋 Welcome!")
-            st.markdown(
-                "I'm your AI Developer Assistant. I can help you with:\n\n"
-                "💡 Programming Q&A · 🧮 Calculations · 🐍 Code Explanation\n\n"
-                "✍️ Code Generation · 🐞 Debugging · 🔍 Code Review · ♻️ Refactoring\n\n"
-                "🧪 Test Generation · ✅ Pytest · 🔎 Ruff · 🎨 Black\n\n"
-                "🎤 Voice Questions · 📎 Document Upload (code, text, PDF, DOCX)\n\n"
-                "🔧 Multi-step development tasks (Phase 6) - the AI plans, proposes file "
-                "changes, and waits for your approval in the sidebar before applying them\n\n"
-                "Pick a **Quick Action** in the sidebar, or just ask naturally - "
-                'try *"Write a Python function to check whether a number is prime."*'
+
+def render_home_page() -> None:
+    st.markdown(
+        '<div class="page-title">AI Developer Assistant</div>'
+        '<div class="page-subtitle">Build, understand, test and improve your '
+        "software with AI.</div>",
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(4)
+    for col, (title, subtitle, prompt_text) in zip(cols, HOME_SHORTCUTS):
+        with col:
+            st.markdown('<div class="shortcut-btn">', unsafe_allow_html=True)
+            if st.button(
+                f"{title}\n{subtitle}",
+                key=f"home_{title}",
+                use_container_width=True,
+            ):
+                _handle_home_shortcut(prompt_text)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    task = _current_task()
+    if task:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Current task</div>', unsafe_allow_html=True
+        )
+        with st.container(border=True):
+            st.markdown(f"**{html.escape(task['task'])}**")
+            for label, status in _task_progress(task["states"]):
+                icon = {"done": "✓", "active": "●", "pending": "○"}[status]
+                st.markdown(
+                    f'<div class="task-step {status}">{icon} {html.escape(label)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Chat page
+# ---------------------------------------------------------------------------
+
+
+def render_chat_page() -> None:
+    st.markdown(
+        '<div class="row-between"><div class="page-title">Developer Assistant</div>'
+        '<div class="pill success">● Ready</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    if not st.session_state.messages:
+        st.markdown(
+            "Ask me to explain code, generate a function, review your project, "
+            "run your tests, or build a whole feature end to end. Try:\n\n"
+            '*"Write a Python function to check whether a number is prime."*'
+        )
+
+    task = _current_task()
+    if task:
+        with st.container(border=True):
+            st.markdown(f"**Task**  \n{html.escape(task['task'])}")
+            st.write("")
+            progress_cols = st.columns(len(_task_progress(task["states"])))
+            for col, (label, status) in zip(
+                progress_cols, _task_progress(task["states"])
+            ):
+                icon = {"done": "✓", "active": "●", "pending": "○"}[status]
+                with col:
+                    st.markdown(
+                        f'<div class="task-step {status}" style="justify-content:center;">'
+                        f"{icon} {html.escape(label)}</div>",
+                        unsafe_allow_html=True,
+                    )
+        st.write("")
+
+    last_message_index = len(st.session_state.messages) - 1
+    for index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            for tool_call in message.get("tool_calls", []):
+                render_tool_box(tool_call)
+            if message["role"] == "assistant":
+                render_answer(message["content"])
+                render_workflow_states(message.get("workflow_states", []))
+                if index == last_message_index:
+                    render_execution_plan(message.get("tool_calls", []))
+                render_tts_button(message["content"], key=f"tts_history_{index}")
+            else:
+                if message.get("source") == "voice":
+                    st.caption("🎤 Voice input · transcribed")
+                st.markdown(message["content"])
+
+    pending_changes = workflow.list_pending_changes()
+    if pending_changes:
+        st.info(
+            f"{len(pending_changes)} proposed change(s) are waiting for your review "
+            "on the **Changes** page."
+        )
+
+    chat_value = st.chat_input(
+        "Ask your developer assistant...",
+        accept_file="multiple",
+        file_type=sorted(documents.SUPPORTED_EXTENSIONS),
+        max_upload_size=documents.MAX_UPLOAD_SIZE_MB,
+        accept_audio=True,
+    )
+
+    user_input = None
+    input_source = None  # "voice" when this turn's text came from a transcription
+
+    if chat_value:
+        newly_attached = False
+        for uploaded in chat_value.files:
+            processed = documents.process_upload(uploaded.name, uploaded.getvalue())
+            if "error" in processed:
+                st.error(f"❌ {uploaded.name}: {processed['error']}")
+            else:
+                # Replace any earlier attachment with the same display name.
+                st.session_state.attached_files = [
+                    f
+                    for f in st.session_state.attached_files
+                    if f["filename"] != processed["filename"]
+                ] + [processed]
+                newly_attached = True
+
+        voice_text = ""
+        if chat_value.audio is not None:
+            with st.spinner("🔴 Transcribing your voice input..."):
+                try:
+                    voice_text = transcribe_audio(
+                        chat_value.audio.getvalue(),
+                        chat_value.audio.type or "audio/wav",
+                    )
+                except Exception as exc:  # noqa: BLE001 - never crash on STT
+                    log_error("transcribe_audio", exc)
+                    st.error(
+                        "🎤 Could not transcribe your voice input. Please try again, "
+                        "or continue using the text input."
+                    )
+            if voice_text:
+                st.info(f'📝 Transcribed: "{voice_text}"')
+            elif chat_value.audio is not None:
+                st.warning(
+                    "🎤 No speech was detected in that recording. Please try again."
+                )
+
+        text_value = (chat_value.text or "").strip()
+        if text_value:
+            user_input = text_value
+        elif voice_text:
+            user_input = voice_text
+            input_source = "voice"
+
+        if newly_attached and user_input:
+            # Stash the question and rerun once so the sidebar's attachment
+            # count (rendered earlier in this same run) reflects the new
+            # attachment before the agent answers.
+            st.session_state.pending_prompt = user_input
+            st.session_state.pending_input_source = input_source
+            st.rerun()
+
+    if st.session_state.pending_prompt and not user_input:
+        user_input = st.session_state.pending_prompt
+        input_source = st.session_state.pending_input_source
+        st.session_state.pending_prompt = None
+        st.session_state.pending_input_source = None
+
+    if user_input:
+        user_input = user_input.strip()
+
+    if user_input:
+        # The chat displays what the user actually typed/said; the agent
+        # additionally receives any attached-document context, clearly
+        # labeled as untrusted reference data.
+        agent_input = user_input
+        document_block = documents.build_document_context_block(
+            st.session_state.attached_files
+        )
+        if document_block:
+            agent_input = f"{document_block}\n\nUser's question: {agent_input}"
+
+        _run_and_render_turn(agent, user_input, agent_input, source=input_source)
+
+
+# ---------------------------------------------------------------------------
+# Project page
+# ---------------------------------------------------------------------------
+
+
+def render_project_page() -> None:
+    st.markdown('<div class="page-title">Project</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-subtitle">This project\'s real file tree '
+        "(read-only).</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("Refresh", key="refresh_project_files"):
+        try:
+            st.session_state.project_tree_cache = tools.list_project_files.invoke({})
+        except Exception as exc:  # noqa: BLE001
+            log_error("list_project_files_ui", exc)
+            st.session_state.project_tree_cache = (
+                "⚠️ Could not read the project structure."
             )
 
-        # -----------------------------------------------------------------
-        # Render chat history
-        # -----------------------------------------------------------------
+    cached = st.session_state.get("project_tree_cache")
+    if cached is None:
+        st.caption("Click Refresh to view the project's real file tree.")
+        return
+    st.code(cached, language=None)
 
-        last_message_index = len(st.session_state.messages) - 1
-        for index, message in enumerate(st.session_state.messages):
-            with st.chat_message(message["role"]):
-                for tool_call in message.get("tool_calls", []):
-                    render_tool_box(tool_call)
-                if message["role"] == "assistant":
-                    render_answer(message["content"])
-                    render_workflow_states(message.get("workflow_states", []))
-                    if index == last_message_index:
-                        render_execution_plan(message.get("tool_calls", []))
-                    render_tts_button(message["content"], key=f"tts_history_{index}")
-                else:
-                    if message.get("source") == "voice":
-                        st.caption("🎤 Voice input · 📝 Transcribed")
-                    st.markdown(message["content"])
 
-        # -----------------------------------------------------------------
-        # Approval Required: every change still awaiting a decision, straight
-        # from the real Phase 6 registry (workflow.list_pending_changes() - the
-        # exact same data the sidebar's "Pending Approvals" section already
-        # shows). Approve here actually resumes the workflow via
-        # _approve_and_resume(); the sidebar's own Approve button is left
-        # exactly as-is (mark-approved-only - ask the assistant to apply it).
-        # -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Documents page
+# ---------------------------------------------------------------------------
 
-        chat_pending_changes = workflow.list_pending_changes()
-        approved_in_chat = None
-        if chat_pending_changes:
-            with st.container(border=True):
-                st.markdown("**⚠️ Approval Required**")
-                st.caption("The following files will be created/modified:")
-                for change in chat_pending_changes:
-                    tag = "new" if change.action == "create" else "modified"
-                    st.markdown(f"• `{change.file_path}` _({tag})_")
-                for change in chat_pending_changes:
-                    approve_col, reject_col = st.columns(2)
-                    with approve_col:
-                        if st.button(
-                            f"✅ Approve {change.change_id}",
-                            key=f"chat_approve_{change.change_id}",
-                            use_container_width=True,
-                        ):
-                            approved_in_chat = change
-                    with reject_col:
-                        if st.button(
-                            f"❌ Reject {change.change_id}",
-                            key=f"chat_reject_{change.change_id}",
-                            use_container_width=True,
-                        ):
-                            workflow.reject_change(change.change_id)
-                            st.rerun()
 
-        # Rendered outside the narrow approve/reject columns above, so the
-        # resulting chat bubbles use the full chat column width like any other
-        # turn instead of being squeezed into a half-width column.
-        if approved_in_chat is not None:
-            _approve_and_resume(agent, approved_in_chat)
+def render_documents_page() -> None:
+    st.markdown('<div class="page-title">Documents</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-subtitle">Documents attached via the Chat page\'s '
+        "attach control.</div>",
+        unsafe_allow_html=True,
+    )
 
-        # -----------------------------------------------------------------
-        # Handle new input: typed text, an attached document, a recorded voice
-        # question, or a prompt clicked from the sidebar - all flow into the
-        # exact same agent call below. Voice is only ever converted to text
-        # (transcribe_audio) before reaching the agent; attached documents are
-        # only ever added as labeled, untrusted reference context - neither
-        # path adds a separate AI implementation.
-        # -----------------------------------------------------------------
-
+    if not st.session_state.attached_files:
         st.caption(
-            "🎤 Ready — use the microphone icon to record a voice question on its "
-            "own, or 📎 to attach a document (type a short question alongside it, "
-            'e.g. "explain this file", before sending). If your browser denies '
-            "microphone access, you can still type your question below."
+            "No documents attached. Attach one from the + control in the Chat "
+            "page's input box."
         )
-        chat_value = st.chat_input(
-            "Ask your AI Developer Assistant...",
-            accept_file="multiple",
-            file_type=sorted(documents.SUPPORTED_EXTENSIONS),
-            max_upload_size=documents.MAX_UPLOAD_SIZE_MB,
-            accept_audio=True,
-        )
+        return
 
-        user_input = None
-        input_source = None  # "voice" when this turn's text came from a transcription
+    for attached in st.session_state.attached_files:
+        with st.container(border=True):
+            st.markdown(f"**{html.escape(attached['filename'])}**")
+            st.caption(
+                f"{attached['file_type']} · "
+                f"{documents.format_size(attached['file_size'])}"
+                + (" · truncated for context" if attached.get("truncated") else "")
+            )
+            st.markdown(
+                '<span class="pill success">✓ Read</span> '
+                '<span class="pill success">✓ Text extracted</span>',
+                unsafe_allow_html=True,
+            )
 
-        if chat_value:
-            newly_attached = False
-            for uploaded in chat_value.files:
-                processed = documents.process_upload(uploaded.name, uploaded.getvalue())
-                if "error" in processed:
-                    st.error(f"❌ {uploaded.name}: {processed['error']}")
+            view_tab, req_tab = st.tabs(["View document", "View requirements"])
+            with view_tab:
+                st.text_area(
+                    "Extracted text",
+                    attached["content"],
+                    height=220,
+                    key=f"doc_view_{attached['filename']}",
+                    label_visibility="collapsed",
+                )
+            with req_tab:
+                content_lower = attached["content"].lower()
+                hits = [
+                    keyword
+                    for keyword in _REQUIREMENT_KEYWORDS
+                    if keyword.lower() in content_lower
+                ]
+                if hits:
+                    st.caption(
+                        "Keyword matches found in the actual extracted text "
+                        "(not a full requirements analysis):"
+                    )
+                    for keyword in hits:
+                        st.markdown(f"✓ {keyword}")
                 else:
-                    # Replace any earlier attachment with the same display name.
-                    st.session_state.attached_files = [
-                        f
-                        for f in st.session_state.attached_files
-                        if f["filename"] != processed["filename"]
-                    ] + [processed]
-                    newly_attached = True
-
-            voice_text = ""
-            if chat_value.audio is not None:
-                with st.spinner("🔴 Transcribing your voice input..."):
-                    try:
-                        voice_text = transcribe_audio(
-                            chat_value.audio.getvalue(),
-                            chat_value.audio.type or "audio/wav",
-                        )
-                    except Exception as exc:  # noqa: BLE001 - never crash on STT
-                        log_error("transcribe_audio", exc)
-                        st.error(
-                            "🎤 Could not transcribe your voice input. Please try again, "
-                            "or continue using the text input."
-                        )
-                if voice_text:
-                    st.info(f'📝 Transcribed: "{voice_text}"')
-                elif chat_value.audio is not None:
-                    st.warning(
-                        "🎤 No speech was detected in that recording. Please try again."
+                    st.caption(
+                        "No recognized tech-stack keywords found in the "
+                        "extracted text."
                     )
 
-            text_value = (chat_value.text or "").strip()
-            if text_value:
-                user_input = text_value
-            elif voice_text:
-                user_input = voice_text
-                input_source = "voice"
+    if st.button("Clear all attachments"):
+        st.session_state.attached_files = []
+        st.rerun()
 
-            if newly_attached and user_input:
-                # The sidebar's "Attached Files" list is rendered earlier in this
-                # same script run (top-to-bottom), so it would otherwise still show
-                # the pre-upload state for this run. Stash the question and rerun
-                # once, the same pending_prompt handoff the sidebar buttons already
-                # use, so the sidebar reflects the new attachment before the agent
-                # answers.
-                st.session_state.pending_prompt = user_input
-                st.session_state.pending_input_source = input_source
+
+# ---------------------------------------------------------------------------
+# Changes page - the one, consolidated Proposed Changes view.
+# ---------------------------------------------------------------------------
+
+
+def render_changes_page() -> None:
+    st.markdown(
+        '<div class="page-title">Proposed Changes</div>', unsafe_allow_html=True
+    )
+
+    pending = workflow.list_pending_changes()
+    if not pending:
+        st.markdown(
+            '<div class="page-subtitle">No pending changes. Ask the assistant to '
+            "add, fix, or refactor something to see one here.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="page-subtitle">{len(pending)} file(s) pending your '
+            "review.</div>",
+            unsafe_allow_html=True,
+        )
+
+    approved_via_button = None
+    for change in pending:
+        risk_pill_class = {"low": "success", "medium": "warning", "high": "error"}.get(
+            change.risk, "warning"
+        )
+        with st.container(border=True):
+            top_col, select_col = st.columns([5, 1])
+            with top_col:
+                st.markdown(
+                    f"**{html.escape(change.file_path)}** &nbsp; "
+                    f'<span class="pill neutral">{change.action.upper()}</span> &nbsp;'
+                    f'<span class="pill {risk_pill_class}">Risk: {change.risk.title()}</span>',
+                    unsafe_allow_html=True,
+                )
+            with select_col:
+                st.checkbox("Select", key=f"select_{change.change_id}")
+            st.caption(f"Purpose: {change.reason}")
+            st.caption(f"Change ID: `{change.change_id}`")
+
+            with st.expander("Review changes"):
+                if change.action == "modify":
+                    safe_path = tools.PROJECT_ROOT / change.file_path
+                    try:
+                        old_text = safe_path.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        old_text = ""
+                    diff_text = _unified_diff(
+                        old_text, change.content, change.file_path
+                    )
+                    if diff_text.strip():
+                        st.markdown(_diff_to_html(diff_text), unsafe_allow_html=True)
+                    else:
+                        st.caption("No textual difference detected.")
+                else:
+                    st.caption("New file - full proposed content:")
+                    st.code(change.content, language=_guess_language(change.file_path))
+
+            approve_col, reject_col = st.columns(2)
+            with approve_col:
+                if st.button(
+                    "Approve",
+                    key=f"approve_{change.change_id}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    approved_via_button = change
+            with reject_col:
+                if st.button(
+                    "Reject",
+                    key=f"reject_{change.change_id}",
+                    use_container_width=True,
+                ):
+                    workflow.reject_change(change.change_id)
+                    st.rerun()
+
+    if approved_via_button is not None:
+        _approve_and_resume(agent, approved_via_button)
+
+    if len(pending) > 1:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Batch actions</div>', unsafe_allow_html=True
+        )
+        st.caption(
+            "Batch actions only mark changes approved/rejected - they never "
+            "apply/write anything automatically. Approve one individually "
+            "(above) to have the assistant apply and test it immediately."
+        )
+        batch_approve_col, batch_reject_col = st.columns(2)
+        with batch_approve_col:
+            if st.button("Approve Selected", use_container_width=True):
+                for change in pending:
+                    if st.session_state.get(f"select_{change.change_id}"):
+                        workflow.approve_change(change.change_id)
+                st.rerun()
+        with batch_reject_col:
+            if st.button("Reject Selected", use_container_width=True):
+                for change in pending:
+                    if st.session_state.get(f"select_{change.change_id}"):
+                        workflow.reject_change(change.change_id)
                 st.rerun()
 
-        if st.session_state.pending_prompt and not user_input:
-            user_input = st.session_state.pending_prompt
-            input_source = st.session_state.pending_input_source
-            st.session_state.pending_prompt = None
-            st.session_state.pending_input_source = None
+    stuck_files = [
+        file_path
+        for file_path, count in workflow.repair_attempts_snapshot().items()
+        if count >= workflow.MAX_REPAIR_ATTEMPTS
+    ]
+    if stuck_files:
+        st.warning(
+            "Repair-attempt limit reached for: "
+            + ", ".join(f"`{f}`" for f in stuck_files)
+            + ". The AI can no longer apply further automatic fixes to these files "
+            "until you reset the counter below."
+        )
+        if st.button("Reset repair counter"):
+            workflow.reset_repair_attempts()
+            st.rerun()
 
-        if user_input:
-            user_input = user_input.strip()
-
-        if user_input:
-            # The chat displays what the user actually typed/said; the agent
-            # additionally receives the Quick Action prefix (if any) and any
-            # attached-document context, clearly labeled as untrusted reference data.
-            prefix = MODE_PREFIXES.get(st.session_state.get("mode_select", "Ask"), "")
-            agent_input = f"{prefix}{user_input}" if prefix else user_input
-            document_block = documents.build_document_context_block(
-                st.session_state.attached_files
+    applied = _applied_changes_this_session()
+    if applied:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Applied this session</div>', unsafe_allow_html=True
+        )
+        for change in applied:
+            st.markdown(
+                f"✓ **{html.escape(change.file_path)}** "
+                f'<span class="pill neutral">{change.action.upper()}</span>',
+                unsafe_allow_html=True,
             )
-            if document_block:
-                agent_input = f"{document_block}\n\nUser's question: {agent_input}"
 
-            _run_and_render_turn(agent, user_input, agent_input, source=input_source)
 
-    with status_col:
-        with st.container(border=True):
-            render_workflow_status_panel()
-        with st.container(border=True):
-            render_tools_used_panel()
+# ---------------------------------------------------------------------------
+# Tests page
+# ---------------------------------------------------------------------------
 
-        files_tab, diff_tab, explorer_tab = st.tabs(
-            ["📄 Files", "🔀 Diff", "🗂 Explorer"]
+
+def render_tests_page() -> None:
+    st.markdown('<div class="page-title">Tests</div>', unsafe_allow_html=True)
+
+    pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
+    if not pytest_calls:
+        st.markdown(
+            '<div class="page-subtitle">No tests run yet. Ask the assistant to run '
+            "the test suite.</div>",
+            unsafe_allow_html=True,
         )
-        with files_tab:
-            render_file_changes_tab()
-        with diff_tab:
-            render_git_diff_tab()
-        with explorer_tab:
-            render_project_explorer_tab()
+        return
 
-        with st.container(border=True):
-            render_test_results_panel()
-
-        render_execution_tabs()
-        render_final_report_banner()
-
-elif st.session_state.nav_view == "📁 Project Explorer":
-    st.markdown("#### 📁 Project Explorer")
-    st.caption("This project's real file tree (read-only) - list_project_files.")
-    render_project_explorer_tab()
-
-elif st.session_state.nav_view == "🧪 Test Results":
-    st.markdown("#### 🧪 Test Results")
-    with st.container(border=True):
-        render_test_results_panel()
-    render_execution_tabs()
-
-elif st.session_state.nav_view == "🛠 Tools":
-    st.markdown("#### 🛠 Tools")
-    st.caption(
-        "Every tool the agent can call this session. ✅ marks a tool that has "
-        "actually run at least once; the rest are available but unused so far."
+    parsed = _parse_pytest_output(pytest_calls[-1]["output"])
+    counts = parsed["counts"]
+    all_passed = parsed["exit_code"] == 0
+    pill_class = "success" if all_passed else "error"
+    summary = f"✓ {counts['passed']} passed" + (
+        "" if all_passed else f" · ✗ {counts['failed']} failed"
     )
-    used_tool_names = {
-        tool_call["name"]
-        for message in st.session_state.messages
-        for tool_call in message.get("tool_calls", [])
-    }
-    for tool_name, display_name in sorted(TOOL_DISPLAY_NAMES.items()):
-        status = (
-            "✅ used this session" if tool_name in used_tool_names else "⚪ available"
+    st.markdown(
+        f'<span class="pill {pill_class}">{summary}</span>', unsafe_allow_html=True
+    )
+    st.write("")
+
+    total_col, passed_col, failed_col, skipped_col = st.columns(4)
+    total_col.metric("Total", parsed["total"])
+    passed_col.metric("Passed", counts["passed"])
+    failed_col.metric("Failed", counts["failed"])
+    skipped_col.metric("Skipped", counts["skipped"])
+
+    detail_col1, detail_col2 = st.columns(2)
+    with detail_col1:
+        duration_text = (
+            f"{parsed['duration']}s" if parsed["duration"] is not None else "—"
         )
-        st.markdown(f"{display_name} — _{status}_")
+        st.markdown(
+            f'<div class="kv-row"><span>Execution time</span><span class="v">{duration_text}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with detail_col2:
+        st.markdown(
+            '<div class="kv-row"><span>Coverage</span><span class="v">Not available</span></div>',
+            unsafe_allow_html=True,
+        )
 
-elif st.session_state.nav_view == "⚙ Settings":
-    st.markdown("#### ⚙ Settings")
-    settings_col1, settings_col2 = st.columns(2)
-    with settings_col1:
-        render_session_info()
-    with settings_col2:
-        render_agent_stats()
+    if parsed["tests"]:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Recent tests</div>', unsafe_allow_html=True
+        )
+        status_icons = {"PASSED": "✓", "SKIPPED": "⏭", "FAILED": "✗", "ERROR": "✗"}
+        for test in parsed["tests"][:15]:
+            icon = status_icons.get(test["status"], "•")
+            st.markdown(f"{icon} `{html.escape(test['name'])}`")
+        remaining = len(parsed["tests"]) - 15
+        if remaining > 0:
+            st.caption(f"...and {remaining} more")
 
-    st.markdown("**Environment configuration**")
+    repair_attempts = workflow.repair_attempts_snapshot()
+    latest_failure = None
+    for tool_call in reversed(pytest_calls):
+        if _parse_pytest_output(tool_call["output"])["exit_code"] not in (0, None):
+            latest_failure = tool_call
+            break
+
+    if repair_attempts or latest_failure:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Failure analysis</div>', unsafe_allow_html=True
+        )
+        for file_path, count in repair_attempts.items():
+            st.caption(
+                f"`{file_path}` — {count} / {workflow.MAX_REPAIR_ATTEMPTS} repair attempts"
+            )
+        if latest_failure:
+            failed_tests = [
+                test
+                for test in _parse_pytest_output(latest_failure["output"])["tests"]
+                if test["status"] in ("FAILED", "ERROR")
+            ]
+            for test in failed_tests:
+                st.markdown(f"✗ `{html.escape(test['name'])}`")
+            with st.expander("Raw failure output"):
+                failure_output = str(latest_failure["output"])[:4000]
+                st.markdown(
+                    f'<pre class="log-block error">{html.escape(failure_output)}</pre>',
+                    unsafe_allow_html=True,
+                )
+
+    with st.expander("Full test output"):
+        latest_output = str(pytest_calls[-1]["output"])[:4000]
+        st.markdown(
+            f'<pre class="log-block">{html.escape(latest_output)}</pre>',
+            unsafe_allow_html=True,
+        )
+
+    ruff_calls = _find_tool_calls(st.session_state.messages, "run_ruff")
+    black_calls = _find_tool_calls(st.session_state.messages, "run_black")
+    if ruff_calls or black_calls:
+        st.write("")
+        st.markdown(
+            '<div class="card-title">Linting / formatting</div>', unsafe_allow_html=True
+        )
+        if ruff_calls:
+            ruff_ok = "no issues" in str(ruff_calls[-1]["output"]).lower()
+            st.markdown(
+                f'<span class="pill {"success" if ruff_ok else "error"}">'
+                f'Ruff — {"✓ Passed" if ruff_ok else "✗ Issues found"}</span>',
+                unsafe_allow_html=True,
+            )
+        if black_calls:
+            black_ok = not str(black_calls[-1]["output"]).lower().startswith("error")
+            st.markdown(
+                f'<span class="pill {"success" if black_ok else "error"}">'
+                f'Black — {"✓ Passed" if black_ok else "✗ Issues found"}</span>',
+                unsafe_allow_html=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Git page
+# ---------------------------------------------------------------------------
+
+
+def render_git_page() -> None:
+    st.markdown('<div class="page-title">Git</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-subtitle">Real, read-only Git information - nothing '
+        "here stages, commits, or modifies anything.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Refresh Git info", key="refresh_git_all"):
+        try:
+            st.session_state.git_branch_cache = tools.git_branch.invoke({})
+        except Exception as exc:  # noqa: BLE001
+            log_error("git_branch_ui", exc)
+            st.session_state.git_branch_cache = "⚠️ Could not read the Git branch."
+        try:
+            st.session_state.git_status_cache = tools.git_status.invoke({})
+        except Exception as exc:  # noqa: BLE001
+            log_error("git_status_ui", exc)
+            st.session_state.git_status_cache = "⚠️ Could not read the Git status."
+        try:
+            st.session_state.git_diff_cache = tools.git_diff.invoke({})
+        except Exception as exc:  # noqa: BLE001
+            log_error("git_diff_ui", exc)
+            st.session_state.git_diff_cache = "⚠️ Could not read the Git diff."
+
+    branch_cache = st.session_state.get("git_branch_cache")
+    status_cache = st.session_state.get("git_status_cache")
+    diff_cache = st.session_state.get("git_diff_cache")
+
+    if branch_cache is None and status_cache is None:
+        st.caption("Click Refresh to view branch, status, and diff.")
+        return
+
+    if branch_cache:
+        st.markdown('<div class="card-title">Branch</div>', unsafe_allow_html=True)
+        st.code(branch_cache, language=None)
+
+    if status_cache:
+        st.markdown('<div class="card-title">Status</div>', unsafe_allow_html=True)
+        st.code(status_cache, language=None)
+
+    if diff_cache:
+        st.markdown('<div class="card-title">Diff</div>', unsafe_allow_html=True)
+        st.markdown(_diff_to_html(diff_cache), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Logs page
+# ---------------------------------------------------------------------------
+
+
+def render_logs_page() -> None:
+    st.markdown('<div class="page-title">Activity Logs</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-subtitle">Real operational events from this session '
+        "(the same events printed to the terminal) - never fabricated.</div>",
+        unsafe_allow_html=True,
+    )
+
+    events = get_recent_events(limit=200)
+    if not events:
+        st.caption("No activity logged yet this session.")
+        return
+
+    lines = [f"{event['time']}  {event['label']}  {event['text']}" for event in events]
+    st.markdown(
+        f'<pre class="log-block">{html.escape(chr(10).join(lines))}</pre>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Clear logs"):
+        clear_events()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Settings page
+# ---------------------------------------------------------------------------
+
+
+def render_settings_page() -> None:
+    st.markdown('<div class="page-title">Settings</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card-title">Model</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kv-row"><span>Model</span><span class="v">{html.escape(get_model_name())}</span></div>'
+        f'<div class="kv-row"><span>Temperature</span><span class="v">{AGENT_TEMPERATURE}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    st.markdown(
+        '<div class="card-title">API configuration status</div>', unsafe_allow_html=True
+    )
     st.caption(
         "Presence only - actual key/token values are never shown in this UI, "
         "logs, execution output, or Git diffs."
@@ -1614,6 +1633,67 @@ elif st.session_state.nav_view == "⚙ Settings":
     }
     for label, var_name in env_vars.items():
         configured = bool(os.getenv(var_name, "").strip())
-        icon = "✅" if configured else "⚪"
-        state = "configured" if configured else "not configured"
-        st.markdown(f"{icon} {label}: _{state}_")
+        pill_class = "success" if configured else "neutral"
+        state = "Configured" if configured else "Not configured"
+        st.markdown(
+            f'<div class="kv-row"><span>{html.escape(label)}</span>'
+            f'<span class="pill {pill_class}">{state}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+    st.markdown('<div class="card-title">Agent behavior</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kv-row"><span>Max auto-continuation steps</span>'
+        f'<span class="v">{workflow.MAX_REPAIR_ATTEMPTS} repair attempts / file</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    st.markdown(
+        '<div class="card-title">Execution settings</div>', unsafe_allow_html=True
+    )
+    st.markdown(
+        '<div class="kv-row"><span>Test execution</span><span class="v">Controlled '
+        "(run_pytest, this project's tests/ folder only)</span></div>"
+        '<div class="kv-row"><span>File writes</span><span class="v">Only after human '
+        "approval</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    st.markdown('<div class="card-title">Theme</div>', unsafe_allow_html=True)
+    st.caption("Light, professional theme - matches this app's design system.")
+
+    st.write("")
+    st.markdown('<div class="card-title">Session</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kv-row"><span>Session ID</span><span class="v">{st.session_state.session_id}</span></div>'
+        f'<div class="kv-row"><span>Started at</span><span class="v">{st.session_state.started_at.strftime("%H:%M")}</span></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Clear conversation"):
+        st.session_state.messages = []
+        st.session_state.lc_history = []
+        st.session_state.pending_prompt = None
+        clear_events()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page router
+# ---------------------------------------------------------------------------
+
+_PAGE_RENDERERS = {
+    "Home": render_home_page,
+    "Chat": render_chat_page,
+    "Project": render_project_page,
+    "Documents": render_documents_page,
+    "Changes": render_changes_page,
+    "Tests": render_tests_page,
+    "Git": render_git_page,
+    "Logs": render_logs_page,
+    "Settings": render_settings_page,
+}
+
+_PAGE_RENDERERS[st.session_state.nav_view]()
