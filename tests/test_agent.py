@@ -7,9 +7,12 @@ GOOGLE_API_KEY. build_agent() is only checked for its no-API-key error path,
 which is raised before any network call is made.
 """
 
+import base64
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+import agent as agent_module
 from agent import (
     SCOPE_REFUSAL_MESSAGE,
     SYSTEM_PROMPT,
@@ -20,6 +23,7 @@ from agent import (
     get_api_key,
     new_ai_message,
     new_human_message,
+    transcribe_audio,
 )
 
 
@@ -191,6 +195,95 @@ def test_system_prompt_rejects_arbitrary_command_execution():
     prompt_lower = SYSTEM_PROMPT.lower()
     assert "powershell" in prompt_lower
     assert "no tool for running" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# Voice input (transcribe_audio) and attached-document security
+# ---------------------------------------------------------------------------
+
+
+class _FakeTranscriptionLLM:
+    """Stands in for ChatGoogleGenerativeAI so transcribe_audio() tests never
+    call the real Gemini API."""
+
+    def __init__(self):
+        self.received_messages = None
+
+    def invoke(self, messages):
+        self.received_messages = messages
+        return AIMessage(content="explain how tools.py works in my project")
+
+
+def test_transcribe_audio_returns_transcribed_text(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakeTranscriptionLLM()
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    text = transcribe_audio(b"fake-audio-bytes", "audio/wav")
+
+    assert text == "explain how tools.py works in my project"
+
+
+def test_transcribe_audio_sends_audio_as_base64_media_block(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakeTranscriptionLLM()
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    transcribe_audio(b"fake-audio-bytes", "audio/wav")
+
+    sent_message = fake_llm.received_messages[0]
+    media_blocks = [
+        block for block in sent_message.content if block.get("type") == "media"
+    ]
+    assert len(media_blocks) == 1
+    assert media_blocks[0]["mime_type"] == "audio/wav"
+    assert base64.b64decode(media_blocks[0]["data"]) == b"fake-audio-bytes"
+
+
+def test_transcribe_audio_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(ValueError):
+        transcribe_audio(b"fake-audio-bytes")
+
+
+def test_transcribe_audio_does_not_build_the_full_tool_using_agent(monkeypatch):
+    # Voice input must only ever produce text - it must never spin up a
+    # second, separate AI agent of its own.
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakeTranscriptionLLM()
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("transcribe_audio must not build a tool-using agent")
+
+    monkeypatch.setattr(agent_module, "create_agent", _fail_if_called)
+
+    transcribe_audio(b"fake-audio-bytes")
+
+
+def test_no_tool_can_execute_arbitrary_code_or_shell_commands():
+    # Structural guarantee behind "uploaded code is never automatically
+    # executed": there is no tool capable of running arbitrary code/shell
+    # commands at all, uploaded or otherwise.
+    forbidden_keywords = ("exec", "eval", "shell", "run_command", "run_python")
+    for tool_obj in TOOLS:
+        name_lower = tool_obj.name.lower()
+        assert not any(
+            keyword in name_lower for keyword in forbidden_keywords
+        ), f"Unexpected execution-capable tool found: {tool_obj.name}"
+
+
+def test_system_prompt_covers_attached_document_security():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "attached document" in prompt_lower
+    assert "untrusted" in prompt_lower
+    assert "never execute" in prompt_lower or "never run" in prompt_lower
     assert "arbitrary" in prompt_lower
 
 
