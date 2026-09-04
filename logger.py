@@ -15,10 +15,41 @@ single line each instead of scattering ad-hoc print statements everywhere.
 
 import re
 import sys
+import time
+from collections import deque
 
 SEPARATOR = "=" * 60
 _INPUT_TRUNCATE_LIMIT = 1500
 _RESULT_TRUNCATE_LIMIT = 3000
+
+# ---------------------------------------------------------------------------
+# In-memory event buffer: the Streamlit UI's "Agent Logs" panel has no way
+# to read this process's own real stdout, so every _section() call below
+# (already sanitized/truncated - the exact same content that prints to the
+# terminal) also lands here as a timestamped entry the UI can read back with
+# get_recent_events(). Single-user simplification: a process-wide buffer,
+# not per-session, matching workflow.py's pending-change registry - this
+# project runs as one local, single-user app/CLI rather than a multi-tenant
+# service.
+# ---------------------------------------------------------------------------
+
+_MAX_EVENT_ENTRIES = 500
+_events: deque = deque(maxlen=_MAX_EVENT_ENTRIES)
+
+
+def get_recent_events(limit: int = 200) -> list[dict]:
+    """The most recent `limit` logged events, oldest first - each a plain
+    {"time": "HH:MM:SS", "label": str, "text": str} dict, already the same
+    sanitized/truncated text that was printed to the terminal."""
+    events = list(_events)
+    return events[-limit:] if limit else events
+
+
+def clear_events() -> None:
+    """Discard the buffered event history (e.g. when the user clears the
+    conversation) - never affects what was already printed to the terminal."""
+    _events.clear()
+
 
 # ---------------------------------------------------------------------------
 # Secret redaction
@@ -78,6 +109,7 @@ def _section(label: str, body: str) -> None:
     print()
     print(f"[{label}]")
     _safe_print(body)
+    _events.append({"time": time.strftime("%H:%M:%S"), "label": label, "text": body})
 
 
 # ---------------------------------------------------------------------------

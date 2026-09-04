@@ -538,6 +538,20 @@ def test_system_prompt_phase6_requires_propose_for_new_code_and_tests():
     assert "showing code without calling propose_file_change" in prompt_lower
 
 
+def test_system_prompt_requires_proposing_every_file_before_approval():
+    """Regression test for a real reported bug: given a multi-file task
+    (e.g. a Task Management API scaffolded from an SRS - model, schema,
+    route, and test files), the agent proposed only the first file
+    (database.py) and asked for approval, leaving the rest of its own
+    stated plan unproposed. The prompt must explicitly require proposing
+    every file in the plan before ever asking for approval."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "propose_file_change once for each of those files" in prompt_lower
+    assert "do not stop and ask the user to approve after only the first file" in (
+        prompt_lower
+    )
+
+
 def test_system_prompt_forbids_truncating_modified_files():
     """Regression test for a real failure observed in live testing: the
     model proposed a "modify" of tools.py that silently cut off most of the

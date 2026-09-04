@@ -216,7 +216,14 @@ concisely - do not hide your steps, but do not narrate raw chain-of-thought eith
    MUST call propose_file_change with the complete new file content and a one-line
    reason. This never writes anything by itself. Never just print the code in your chat
    answer and call the task done - showing code without calling propose_file_change means
-   nothing was actually added to the project. When modifying an existing file, `new_content`
+   nothing was actually added to the project. If your own plan from step 1 touches more
+   than one file (e.g. a model file, the API/route file, and its test file), call
+   propose_file_change once for EACH of those files in this same turn before asking for
+   approval - do not stop and ask the user to approve after only the first file while
+   other files from your own stated plan are still unproposed; a human reviewing a
+   partial plan can't meaningfully approve a task they can't see the whole shape of yet.
+   Only stop proposing and ask for approval once every file your plan identified has a
+   pending change_id. When modifying an existing file, `new_content`
    must be the ENTIRE file with your change applied - reproduce every existing line
    unchanged except where you are actually editing; never shorten, summarize, or cut off
    the rest of the file with a placeholder like "... rest of file omitted" - that would
@@ -354,6 +361,17 @@ def get_api_key() -> str | None:
     return os.getenv("GOOGLE_API_KEY")
 
 
+DEFAULT_MODEL_NAME = "gemini-flash-lite-latest"
+AGENT_TEMPERATURE = 0.3
+
+
+def get_model_name() -> str:
+    """The Gemini model name actually in use (env override or the default),
+    for display in the UI's Session Info panel - never guessed/hardcoded
+    separately from what _build_llm() itself uses."""
+    return os.getenv("GEMINI_MODEL", DEFAULT_MODEL_NAME)
+
+
 def _build_llm(temperature: float) -> ChatGoogleGenerativeAI:
     """Build a Gemini chat model using this project's configured API key/model.
 
@@ -368,9 +386,8 @@ def _build_llm(temperature: float) -> ChatGoogleGenerativeAI:
             "GOOGLE_API_KEY is not configured. Please add it to your .env file."
         )
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
     return ChatGoogleGenerativeAI(
-        model=model_name,
+        model=get_model_name(),
         google_api_key=api_key,
         temperature=temperature,
     )
@@ -382,7 +399,7 @@ def build_agent():
     Returns a compiled agent graph with an `.invoke({"messages": [...]})`
     method. Raises ValueError if no API key is configured.
     """
-    llm = _build_llm(temperature=0.3)
+    llm = _build_llm(temperature=AGENT_TEMPERATURE)
     return create_agent(model=llm, tools=TOOLS, system_prompt=SYSTEM_PROMPT)
 
 

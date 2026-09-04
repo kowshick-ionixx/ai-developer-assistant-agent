@@ -454,3 +454,81 @@ def test_clicking_reset_repair_counter_clears_the_tally(apptest_with_mocked_agen
     assert at.exception == []
 
     assert workflow.repair_attempts_for("stuck_file.py") == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: the in-chat "Approval Required" card. Unlike the sidebar's Approve
+# button (mark-approved-only, by design - see
+# test_approving_a_change_does_not_touch_conversation_or_other_state above),
+# this card's Approve button actually resumes the workflow by driving the
+# real agent through run_agent_turn again.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_approve_button_resumes_the_workflow(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+
+    import agent as agent_module
+
+    calls = []
+
+    def fake_run_agent_turn_resuming(agent, history):
+        calls.append(history[-1].content)
+        return {
+            "answer": "Applied the change and all tests pass.",
+            "tool_calls": [
+                {
+                    "name": "apply_approved_change",
+                    "input": {"change_id": "abc123"},
+                    "output": "ok",
+                }
+            ],
+            "workflow_states": ["IMPLEMENTING", "TESTING", "REVIEWING", "COMPLETED"],
+        }
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn_resuming)
+
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    workflow._pending_changes.pop(change.change_id)
+    change.change_id = "abc123"
+    workflow._pending_changes["abc123"] = change
+
+    at.run(timeout=30)
+    assert at.exception == []
+
+    approve_btn = next(b for b in at.button if b.key == "chat_approve_abc123")
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert workflow.get_change("abc123").approved is True
+    assert calls, "run_agent_turn should have been called to resume the workflow"
+    assert "abc123" in calls[-1]
+
+    messages = at.session_state["messages"]
+    assert messages[-1]["content"] == "Applied the change and all tests pass."
+    assert messages[-1]["workflow_states"][-1] == "COMPLETED"
+    assert messages[-2]["content"].startswith("✅ Approved change")
+
+
+def test_chat_reject_button_removes_the_pending_change(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+    assert at.exception == []
+
+    reject_btn = next(
+        b for b in at.button if b.key == f"chat_reject_{change.change_id}"
+    )
+    reject_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert workflow.get_change(change.change_id) is None

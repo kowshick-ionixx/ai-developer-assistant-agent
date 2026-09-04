@@ -10,8 +10,17 @@ This module holds only plain data and in-memory registries - it has no
 filesystem, LangChain, or Streamlit access of its own:
     - WorkflowStatus / WorkflowState track a task's concise operational
       progress (plan, completed/pending steps, files touched, test results,
-      retry count) for display in the UI/logs. Never chain-of-thought, never
-      secrets.
+      retry count). Never chain-of-thought, never secrets. NOTE: the actual
+      workflow-status trail shown in the running app (app.py/cli.py) is
+      built by agent.py's _derive_workflow_states(), a separate, simpler
+      mechanism that reads off which tools were actually called - it does
+      NOT instantiate WorkflowState or go through transition_to()'s
+      validation below. WorkflowState/transition_to() are a real,
+      independently-tested reference implementation of a stricter state
+      machine (see tests/test_workflow.py), available for a caller that
+      wants enforced transitions, but they are not on the live request path
+      today - don't assume an "invalid transition" here would ever surface
+      to a user.
     - ProposedChange + the pending-change registry are the human-approval
       gate for tools.py's propose_file_change/apply_approved_change: a
       change can only move from "proposed" to "written to disk" once
@@ -52,9 +61,12 @@ class WorkflowStatus(str, Enum):
     FAILED = "FAILED"
 
 
-# Controlled state transitions - keeps the workflow from jumping into a
-# nonsensical state or looping forever. A transition not listed here (and
-# not a same-state no-op) raises ValueError in WorkflowState.transition_to().
+# Controlled state transitions for WorkflowState.transition_to() (see the
+# module docstring above - this validation is exercised by WorkflowState
+# directly and by tests/test_workflow.py, but is NOT currently wired into
+# the live app's workflow-status display, which uses agent.py's
+# _derive_workflow_states() instead). A transition not listed here (and not
+# a same-state no-op) raises ValueError in transition_to().
 _ALLOWED_TRANSITIONS: dict[WorkflowStatus, set[WorkflowStatus]] = {
     WorkflowStatus.IDLE: {WorkflowStatus.PLANNING},
     WorkflowStatus.PLANNING: {WorkflowStatus.INSPECTING, WorkflowStatus.FAILED},
@@ -141,6 +153,12 @@ class WorkflowState:
     one-liners, error messages) - never full chain-of-thought and never
     secrets. `tool_results`/`errors` entries should already be the
     human-readable summary a UI can show directly.
+
+    Not currently instantiated by the live app (app.py/cli.py) or by
+    agent.py's run_agent_turn() - see the module docstring. It's a real,
+    tested, stricter-transition-validated alternative to
+    _derive_workflow_states()'s simpler tool-call-driven trail, available
+    for a caller that needs enforced state transitions.
     """
 
     user_task: str

@@ -15,8 +15,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Streamlit
-.streamlit/
+# Streamlit (secrets only - config.toml holds the app's theme, not secrets,
+# and is tracked so the dark dashboard theme ships with the project)
+.streamlit/*
+!.streamlit/config.toml
 
 # IDE / OS
 .vscode/

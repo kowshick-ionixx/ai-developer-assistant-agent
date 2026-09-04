@@ -93,6 +93,33 @@ def test_run_ruff_accepts_project_root_directory():
     assert "was not found" not in result.lower()
 
 
+def test_run_ruff_file_path_rejects_directory_traversal():
+    result = run_ruff.invoke({"file_path": "../outside.py"})
+    assert "outside the project directory" in result
+
+
+def test_run_ruff_file_path_rejects_absolute_path_outside_project():
+    result = run_ruff.invoke(
+        {"file_path": "../../../../Windows/System32/drivers/etc/hosts"}
+    )
+    assert "outside the project directory" in result
+
+
+def test_run_ruff_file_path_rejects_dot_env():
+    """Regression test: run_ruff's file_path branch used to skip the
+    exclusion/blocked-file check every other file-touching tool has, so a
+    crafted file_path could get .env's real contents linted (and returned
+    unredacted in the tool result) instead of being rejected outright."""
+    result = run_ruff.invoke({"file_path": ".env"})
+    assert "cannot be checked" in result.lower()
+    assert "GOOGLE_API_KEY" not in result
+
+
+def test_run_ruff_file_path_rejects_excluded_directory():
+    result = run_ruff.invoke({"file_path": "venv"})
+    assert "cannot be checked" in result.lower()
+
+
 def test_run_black_formats_pasted_code():
     messy = "def add(a,b):\n return a+b\n"
     formatted = run_black.invoke({"code": messy})

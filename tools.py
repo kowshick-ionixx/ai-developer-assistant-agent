@@ -602,6 +602,10 @@ def run_ruff(code: str = "", file_path: str = "") -> str:
                 result = f"Error: '{file_path}' is outside the project directory and cannot be checked."
                 log_tool_result(result)
                 return result
+            if _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+                result = f"Error: '{file_path}' cannot be checked for security reasons."
+                log_tool_result(result)
+                return result
             if not safe_path.exists():
                 result = f"Error: '{file_path}' was not found in the project."
                 log_tool_result(result)
@@ -1612,6 +1616,29 @@ def github_get_pull_requests(repo_full_name: str = "", state: str = "open") -> s
 # ---------------------------------------------------------------------------
 
 
+def _top_level_def_names(source: str) -> set[str]:
+    """Names of every top-level function/class defined in `source`, or an
+    empty set if it doesn't parse as valid Python - never raises, since this
+    only feeds a best-effort risk warning, not a hard block."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _removed_top_level_defs(existing_source: str, new_source: str) -> set[str]:
+    """Top-level function/class names present in `existing_source` that are
+    no longer present (by name) in `new_source`. Only catches a def/class
+    that disappeared outright - not a signature change to one that's still
+    present - so this is a best-effort safety net, not a full diff."""
+    return _top_level_def_names(existing_source) - _top_level_def_names(new_source)
+
+
 @tool
 def propose_file_change(file_path: str, new_content: str, reason: str) -> str:
     """Propose creating or modifying a project file. This NEVER writes
@@ -1662,24 +1689,53 @@ def propose_file_change(file_path: str, new_content: str, reason: str) -> str:
     # as high risk with an explicit warning rather than silently registered
     # at the default risk level.
     risk = "medium"
-    warning = ""
+    warnings: list[str] = []
+    existing_text = ""
     if action == "modify":
         try:
-            existing_length = len(safe_path.read_text(encoding="utf-8"))
+            existing_text = safe_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            existing_length = 0
+            existing_text = ""
+        existing_length = len(existing_text)
         new_length = len(new_content)
         if existing_length > 200 and new_length < existing_length * 0.6:
             risk = "high"
-            warning = (
-                f"\n\nWARNING: the proposed content ({new_length} characters) is "
-                f"much shorter than the current file ({existing_length} characters). "
-                "This often means part of the existing file was left out by mistake "
-                "(e.g. truncated with a placeholder comment) rather than an "
-                "intentional rewrite. Review the full proposed content carefully "
-                "before approving - do not approve this without checking that "
-                "nothing important was dropped."
+            warnings.append(
+                f"the proposed content ({new_length} characters) is much shorter "
+                f"than the current file ({existing_length} characters). This often "
+                "means part of the existing file was left out by mistake (e.g. "
+                "truncated with a placeholder comment) rather than an intentional "
+                "rewrite."
             )
+
+        # A second, independent check: even when the new content is a similar
+        # *length*, a "modify" of a .py file can still silently drop existing
+        # top-level functions/classes while adding new ones (observed in real
+        # testing - the overall file size stayed similar, so the length check
+        # above missed it, but several existing helper functions had simply
+        # vanished). This is a cheap, read-only AST comparison, not a full
+        # correctness check - it only catches a top-level def/class that
+        # disappeared by name, not e.g. a signature change to a function
+        # that's still present, so it's a real safety net, not a guarantee.
+        if safe_path.suffix == ".py" and existing_text.strip():
+            removed_names = _removed_top_level_defs(existing_text, new_content)
+            if removed_names:
+                risk = "high"
+                names_list = ", ".join(f"'{name}'" for name in sorted(removed_names))
+                warnings.append(
+                    f"the current file defines {names_list} at the top level, but "
+                    "the proposed content does not - this usually means existing "
+                    "functionality was accidentally dropped while rewriting the "
+                    "file rather than intentionally removed."
+                )
+
+    warning = (
+        "\n\nWARNING: " + " Also, ".join(warnings) + "\nReview the full proposed "
+        "content carefully before approving - do not approve this without "
+        "checking that nothing important was dropped."
+        if warnings
+        else ""
+    )
 
     change = register_change(
         file_path=file_path,

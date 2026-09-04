@@ -120,12 +120,15 @@ def test_propose_file_change_flags_suspicious_truncation_as_high_risk():
 
 
 def test_propose_file_change_does_not_flag_normal_sized_modification():
-    current_length = len((PROJECT_ROOT / "tools.py").read_text(encoding="utf-8"))
-    # Comparable size to the real file (90%) - a normal edit, not a truncation.
+    # A real, non-truncating edit: the actual current file plus one appended
+    # comment line - every existing top-level function/class is still
+    # present and the length is essentially unchanged, so neither the
+    # length-based nor the removed-symbol risk check should fire.
+    current_content = (PROJECT_ROOT / "tools.py").read_text(encoding="utf-8")
     modify_result = propose_file_change.invoke(
         {
             "file_path": "tools.py",
-            "new_content": "x = 1\n" * int(current_length * 0.9 / len("x = 1\n")),
+            "new_content": current_content + "\n# a harmless trailing comment\n",
             "reason": "t",
         }
     )
@@ -133,6 +136,37 @@ def test_propose_file_change_does_not_flag_normal_sized_modification():
     assert "warning" not in modify_result.lower()
 
     change_id = _extract_change_id(modify_result)
+    workflow.reject_change(change_id)
+
+
+def test_propose_file_change_flags_dropped_top_level_functions_as_high_risk():
+    """Regression test for a real failure observed in live end-to-end
+    testing: the model proposed a "modify" of tools.py that was a similar
+    overall LENGTH to the original (so the truncation-length check below
+    didn't fire) but silently dropped several existing top-level helper
+    functions while adding a new one - deleting real, working functionality
+    that a human approver would have had no easy way to notice from the
+    length or the reason text alone."""
+    current_content = (PROJECT_ROOT / "tools.py").read_text(encoding="utf-8")
+    # Same overall shape/length as the real file, but with one real
+    # top-level function's definition line renamed away so it no longer
+    # exists under its original name - simulates "similar size, but a real
+    # function silently vanished" without actually being drastically shorter.
+    modified_content = current_content.replace(
+        "def calculator(expression: str) -> str:",
+        "def _renamed_and_no_longer_registered(expression: str) -> str:",
+        1,
+    )
+    modify_result = propose_file_change.invoke(
+        {"file_path": "tools.py", "new_content": modified_content, "reason": "t"}
+    )
+    assert "risk=high" in modify_result
+    assert "'calculator'" in modify_result
+    assert "does not" in modify_result
+
+    change_id = _extract_change_id(modify_result)
+    change = workflow.get_change(change_id)
+    assert change.risk == "high"
     workflow.reject_change(change_id)
 
 
