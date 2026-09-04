@@ -2,7 +2,7 @@
 
 ## Overview
 
-A beginner-friendly AI agent built with **Python**, **LangChain**, **Google Gemini**, and **Streamlit** that behaves like a junior software developer. It answers programming questions, does math, explains code, and — as of Phase 2 — generates, debugs, reviews, refactors, and tests code, and can run Pytest/Ruff/Black on request. It decides for itself, on every message, whether it needs a tool or can just answer directly. It is also **project-aware**: it can inspect this project's own real structure, files, and source code (via `list_project_files`/`read_project_file`/`search_project`) to answer questions about itself accurately, instead of guessing. As of Phase 4, it can also reach outside the project: **web/documentation search** (via Tavily) for current framework/API information, **read-only Git inspection**, **read-only GitHub repository/issue/PR lookups**, and **commit-message and documentation generation** grounded in the project's real diff/files. As of Phase 5, it can also check Python files for syntax errors (`check_python_syntax`), analyze real pytest failures and tracebacks by combining `run_pytest`'s actual output with `read_project_file`/`search_project`, and verify a fix by rerunning the suite — always reporting real results, never fabricated ones.
+A beginner-friendly AI agent built with **Python**, **LangChain**, **Google Gemini**, and **Streamlit** that behaves like a junior software developer. It answers programming questions, does math, explains code, and — as of Phase 2 — generates, debugs, reviews, refactors, and tests code, and can run Pytest/Ruff/Black on request. It decides for itself, on every message, whether it needs a tool or can just answer directly. It is also **project-aware**: it can inspect this project's own real structure, files, and source code (via `list_project_files`/`read_project_file`/`search_project`) to answer questions about itself accurately, instead of guessing. As of Phase 4, it can also reach outside the project: **web/documentation search** (via Tavily) for current framework/API information, **read-only Git inspection**, **read-only GitHub repository/issue/PR lookups**, and **commit-message and documentation generation** grounded in the project's real diff/files. As of Phase 5, it can also check Python files for syntax errors (`check_python_syntax`), analyze real pytest failures and tracebacks by combining `run_pytest`'s actual output with `read_project_file`/`search_project`, and verify a fix by rerunning the suite — always reporting real results, never fabricated ones. It also supports 🎤 voice questions and 📎 document upload (code, text, PDF, DOCX) directly from the chat bar. As of Phase 6, it can carry out **multi-step development tasks** — plan, inspect, propose a file change, and (only once a human approves it in the sidebar) apply it and re-test — instead of only answering one question at a time.
 
 This project exists to teach one thing clearly: **how an AI agent actually works**.
 
@@ -47,6 +47,20 @@ This project exists to teach one thing clearly: **how an AI agent actually works
 - 🔁 Fix-and-verify workflow — since there is no file-editing tool, the assistant explains the needed code change and only claims an issue "is fixed" after rerunning `run_pytest` and seeing the real result
 - 📊 Regression checking — reruns the full suite after a fix and reports actual before/after pass/fail counts
 
+**Voice & Document Upload**
+- 🎤 Voice questions — record from the chat bar's built-in microphone button; transcribed to text by Gemini's native audio understanding (no separate speech-to-text service)
+- 📎 Document upload — attach `.py`/`.txt`/`.md`/`.json`/`.csv`/`.yaml`/`.yml`/`.toml`/`.xml`/`.html`/`.css`/`.js`/`.ts`/`.pdf`/`.docx` files directly from the chat bar; content is validated, size-limited, secret-redacted, and added as labeled, untrusted reference context
+- 🔊 Optional "Read aloud" button on any answer, using the browser's own text-to-speech
+
+**Phase 6**
+- 📋 Task planning — a short, concrete numbered plan for a multi-step development request
+- 🔍 Autonomous tool selection across a whole conversation (inspect → search docs → propose → test)
+- 📝 Controlled file creation/modification (`propose_file_change`) — proposes a complete new file's contents; never writes anything by itself
+- ✅ Human approval gate (`apply_approved_change`) — a change can only be written to disk after you click Approve in the sidebar; the tool itself refuses an unapproved change_id, even if asked to skip approval
+- 📄 PDF/document requirements → project generation — reuses the existing document-upload feature as the requirements source for the same propose → approve → apply → test flow
+- 🔁 Test → analyze → fix → retest loop, guided by a stated maximum of 3 repair attempts per task
+- 🔧 Workflow-state observability (`[WORKFLOW]`/`[APPROVAL]` log sections, and a "Workflow: ..." caption in the UI) derived from which tools actually ran
+
 **All phases**
 - 🔧 Visible tool calling, so you can see exactly when and why a tool ran
 - 🎯 Optional Quick Action mode selector (Ask / Generate / Debug / Review / Refactor / Test)
@@ -70,7 +84,8 @@ TOOLS (calculator / code explainer / pytest / ruff / black / check_python_syntax
        list_project_files / read_project_file / search_project /
        web_search / documentation_search /
        git_status / git_log / git_diff / git_branch /
-       github_get_repository / github_get_issues / github_get_pull_requests)
+       github_get_repository / github_get_issues / github_get_pull_requests /
+       propose_file_change / apply_approved_change)
   ↓
 TOOL RESULT
   ↓
@@ -190,9 +205,11 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 
 ## Important Files
 
-- **`app.py`** — the Streamlit UI only. Renders the sidebar (features, Quick Actions, example questions), chat history, input box, and tool-call boxes. Calls into `agent.py` for anything AI-related; contains no LLM or tool logic itself.
-- **`agent.py`** — the agent itself. Loads the API key, configures the Gemini model, defines the system prompt (including the Phase 2 response-format, Phase 4 external-knowledge/Git/GitHub instructions, and Phase 5 execution/error-analysis/security instructions), and builds the LangChain agent (`create_agent`) with all eighteen tools attached.
-- **`tools.py`** — the eighteen tools, each a plain Python function wrapped in LangChain's `@tool` decorator:
+- **`app.py`** — the Streamlit UI only. Renders the sidebar (features, Quick Actions, attached files, Phase 6 pending approvals, the AI Features reference panel), chat history, input box (with built-in 📎 attach and 🎤 record buttons), and tool-call boxes. Calls into `agent.py`/`documents.py`/`workflow.py` for anything AI-related; contains no LLM or tool logic itself.
+- **`agent.py`** — the agent itself. Loads the API key, configures the Gemini model, defines the system prompt (including the Phase 2 response-format, Phase 4 external-knowledge/Git/GitHub instructions, Phase 5 execution/error-analysis/security instructions, and the Phase 6 controlled-development-task instructions), and builds the LangChain agent (`create_agent`) with all twenty tools attached. Also exposes `transcribe_audio()` (voice → text via Gemini's native audio understanding) and `create_plan()` (Phase 6 task planner) as separate, single-completion calls that never build a second tool-using agent.
+- **`documents.py`** — validates, parses, and sanitizes documents attached via the chat bar (text formats directly, `.pdf` via `pypdf`, `.docx` via `python-docx`), redacting secret-looking content before it is ever shown or sent to the model.
+- **`workflow.py`** — Phase 6's plain data structures: `WorkflowStatus`/`WorkflowState` (concise, observable task progress with controlled state transitions) and the pending-change registry (`register_change`/`approve_change`/`reject_change`/`list_pending_changes`) behind the human-approval gate. Holds no filesystem or LangChain logic of its own.
+- **`tools.py`** — twenty tools, each a plain Python function wrapped in LangChain's `@tool` decorator:
   - `calculator` — parses the expression with Python's `ast` module and evaluates it node-by-node against an allow-list of operators. Never calls `eval()`.
   - `explain_python_code` — parses code with `ast` to list its structure **without running it**.
   - `run_pytest` — runs this project's own fixed `tests/` suite via `python -m pytest` and reports the exit code and output.
@@ -206,8 +223,10 @@ Try these in the chat (some are also available as one-click buttons in the sideb
   - `documentation_search` — same as `web_search`, but biases toward official documentation domains for recognized frameworks/libraries.
   - `git_status` / `git_log` / `git_diff` / `git_branch` — read-only local Git inspection, sandboxed to this project's own repository (no parent-directory search), with capped commit/diff output and automatic redaction of any credential-like file's diff content.
   - `github_get_repository` / `github_get_issues` / `github_get_pull_requests` — read-only GitHub lookups via PyGithub; `GITHUB_TOKEN` is optional (falls back to anonymous, rate-limited access), and results are capped to 10 items.
+  - `propose_file_change` (Phase 6) — registers a pending file create/modify in `workflow.py`; validated against the same project-root/excluded/blocked-file rules as `read_project_file`, but **never writes anything**.
+  - `apply_approved_change` (Phase 6) — writes a previously proposed change to disk, but only if `workflow.approve_change()` has already been called for that `change_id` — which only the Streamlit UI's Approve button (or the CLI's approval prompt) can do. The agent has no tool that can approve its own change.
 - **`conftest.py`** — empty file at the project root so `pytest` can resolve `import tools` / `import agent` from `tests/` without a package layout.
-- **`tests/`** — the project's own automated test suite (`test_tools.py`, `test_agent.py`, `test_logger.py`, `test_web_tools.py`, `test_git_tools.py`, `test_github_tools.py`), which is also what the `run_pytest` tool executes when you ask the assistant to "run the tests."
+- **`tests/`** — the project's own automated test suite (`test_tools.py`, `test_agent.py`, `test_logger.py`, `test_web_tools.py`, `test_git_tools.py`, `test_github_tools.py`, `test_documents.py`, `test_workflow.py`, `test_dev_tools.py`, `test_app.py`), which is also what the `run_pytest` tool executes when you ask the assistant to "run the tests."
 
 ## Developer Tools (Phase 2)
 
@@ -251,9 +270,32 @@ Try these in the chat (some are also available as one-click buttons in the sideb
 | Syntax checking | `check_python_syntax` tool — parses file(s) with `ast`, never executes them |
 | Traceback analysis | Gemini reasoning over the actual traceback text — Problem / Cause / Location / Suggested fix, never inventing a file or line not present in it |
 | Test failure analysis | Gemini reasoning over `run_pytest`'s real output plus `read_project_file`/`search_project` on the failing test and the source it exercises |
-| Fix-and-verify workflow | Gemini explains the needed code change (no file-editing tool exists); only reruns `run_pytest` and only claims "fixed" after the real rerun confirms it |
+| Fix-and-verify workflow | Gemini explains the needed code change and (Phase 6) can propose it as a file change for approval; only reruns `run_pytest` and only claims "fixed" after the real rerun confirms an *applied* change |
 | Regression testing | Rerunning `run_pytest` after a fix and comparing the two real before/after pass/fail counts |
 | Security | No generic command-execution tool exists at all — arbitrary PowerShell/CMD/shell commands, unrestricted Python execution, and destructive/file-modifying requests are refused by the system prompt rather than attempted |
+
+## Phase 6 — Autonomous Software Development
+
+Phase 6 turns multi-step development requests ("add a feature", "fix this bug", "generate this project from the uploaded PDF") into a controlled, human-approved sequence instead of a single Q&A answer — while reusing every existing tool and adding three new ones.
+
+| Capability | How it's implemented |
+|---|---|
+| Request classification | A "## Request Classification" section in the system prompt distinguishes a pure calculation ("Calculate 5 factorial" → `calculator`) from a development request that merely mentions a math concept ("Add a function to calculate the factorial of a number" → propose real code) — fixed after live testing showed the model could otherwise call `calculator` (or worse, skip `propose_file_change` entirely and just print code as chat text while falsely claiming "all tests passed") for a compound "add X, test X, verify X" request; `calculator`'s own docstring was also hardened with an explicit exclusion and example |
+| Task planning | `agent.create_plan()` — a single, separate Gemini completion call (like `transcribe_audio`) that returns a short numbered plan; shown to the user as a preview, not chain-of-thought |
+| Autonomous tool selection | The existing LangChain `create_agent` tool-calling loop, guided by a new "Phase 6" section in the system prompt — the same mechanism Phases 1-5 already use, just with more tools available in one conversation |
+| Workflow state | `workflow.WorkflowStatus`/`WorkflowState` — an enum with controlled transitions (`transition_to()` raises on an invalid jump) and a dataclass holding only concise summaries (plan, completed/pending steps, file list, retry count) — never chain-of-thought or secrets |
+| Controlled file creation/modification | `propose_file_change` — validates the path (same rules as `read_project_file`) and registers a `ProposedChange`; **never writes to disk**. A "modify" proposal that is drastically shorter than the file it replaces (e.g. the model truncating a large file with a placeholder comment instead of reproducing it in full — observed once in live testing) is flagged `risk="high"` with an explicit warning, since a human approver reviewing a large diff might not otherwise notice a silent truncation |
+| Human approval | `workflow.approve_change()`/`reject_change()`, called only from the Streamlit sidebar's "🔧 Pending Approvals" section (Approve/Reject buttons) or an equivalent CLI prompt — never from a tool the agent itself can call |
+| Applying a change | `apply_approved_change` — refuses to write anything unless `ProposedChange.approved` is already `True`; re-validates path safety independently at apply time too |
+| PDF/document → project generation | Reuses the existing document-upload feature (Part of Phase 5.5): the uploaded document's extracted, sanitized text becomes the "ATTACHED DOCUMENT CONTEXT" the agent treats as requirements, then follows the same propose → approve → apply → test flow |
+| Test → analyze → fix → retest loop | `run_pytest` after an applied change, `read_project_file`/`search_project` plus the real failure output to diagnose, another `propose_file_change` for the fix. **The `MAX_REPAIR_ATTEMPTS = 3` limit is enforced in code, not just prompted**: `workflow.py` tallies applies per file and clears the tally only on a passing `run_pytest`; once a file has been applied 3 times with no passing run in between, `apply_approved_change` itself refuses to write it again (with the real reason in its output) until a human resets the counter (a "🔄 Reset repair counter" control appears in the sidebar once any file hits the limit) |
+| Cross-turn change lookup | `list_pending_changes` — a read-only tool that lists every real pending change (id, file, approved status, risk); the system prompt tells the model to call it before proposing a duplicate change or assuming an earlier turn's change_id/approval status is still accurate, instead of relying on its own memory of the conversation |
+| Regression testing | Rerunning the full `run_pytest` suite after a change and reporting the actual before/after pass/fail counts (same mechanism as Phase 5) |
+| Git-aware development | `git_status` before starting, `git_diff` after applying — still strictly read-only; there is still no tool that can commit, push, or otherwise change the repository |
+| Observability | New `[PHASE 6]`/`[PLANNER]`/`[WORKFLOW]`/`[APPROVAL]` log sections in `logger.py`, and a "🔧 Workflow: ..." caption in the Streamlit UI, derived from which tools actually ran this turn |
+| Security | Everything above reuses the exact same project-root/excluded/blocked-file checks as the read-only tools; the human-approval gate is enforced in code (`ProposedChange.approved`), not just by a prompt instruction — see [Security Notes](#security-notes) |
+
+**Honest scope note:** the workflow-status trail shown in the UI/logs is derived *after* a turn's tool calls already ran (LangChain's `create_agent` loop is synchronous), not pushed live per call — it is accurate, observable progress reporting, not a real-time stream; fixing this for real would mean switching `ask_agent()` from `agent.invoke()` to `agent.stream()` and reworking how tests stand in for the agent, which was judged too large a change to make as a side effect of an audit and is left as documented, known behavior rather than "fixed" without real verification. The `MAX_REPAIR_ATTEMPTS = 3` limit and cross-turn change lookup, by contrast, **are now real, code-level fixes** (see the table above) rather than prompt-only policy: `apply_approved_change` itself refuses a file's 4th consecutive apply without a passing test in between, and `list_pending_changes` gives the model (and a human) a ground-truth read of pending changes instead of relying on conversation memory. Neither eliminates every possible model mistake on its own - a model can still occasionally re-propose a duplicate change instead of calling `list_pending_changes` first - but the structural gates underneath (the approval flag, the per-file repair tally) hold regardless of what the model does, which is the actual backstop. Both the request-classification fix and the truncation-detection safeguard were added after a live audit turned up the exact scenarios they now catch — a compound "add X, create tests, run tests, verify" request momentarily bypassing `propose_file_change` entirely, and a large "modify" proposal that silently dropped most of the target file's real content.
 
 ## Core Concepts
 
@@ -298,8 +340,8 @@ This project uses **LangChain 1.x**, which replaced the older `initialize_agent`
 - `logger.py`'s secret redaction also recognizes GitHub token formats (`ghp_`/`gho_`/`github_pat_`/etc.) and Tavily key formats (`tvly-`), in addition to the existing Google API key and generic `KEY=`/`TOKEN=`/`SECRET=` patterns.
 - **There is no generic "run a command" tool, and Phase 5 does not add one.** `run_pytest`, `run_ruff`, `run_black`, and `check_python_syntax` remain the only tools that touch the filesystem/an external process, each restricted exactly as described above; `check_python_syntax` only ever calls `ast.parse()` on file contents it already validated with the same path-safety/exclusion/blocked-file checks as `read_project_file` — it never executes anything.
 - Every subprocess-based tool (`run_pytest`/`run_ruff`/`run_black`) enforces a fixed timeout, so a hung process can never block the agent indefinitely; a timeout is always reported honestly ("took too long") instead of as a fabricated success.
-- The system prompt explicitly instructs the assistant to refuse requests for arbitrary PowerShell/CMD/shell commands, unrestricted Python execution, and destructive or file-modifying operations (e.g. "delete all files"), explaining that no such tool exists rather than attempting the request another way. It may name environment variables (`GOOGLE_API_KEY`, `TAVILY_API_KEY`, `GITHUB_TOKEN`) but is instructed to never state or guess their values.
-- Since no file-editing tool exists, the assistant can explain a fix for a failing test but cannot apply it — it only reruns `run_pytest` (and only claims an issue is fixed) after that real rerun confirms it.
+- The system prompt explicitly instructs the assistant to refuse requests for arbitrary PowerShell/CMD/shell commands and unrestricted Python execution, explaining that no such tool exists rather than attempting the request another way. It may name environment variables (`GOOGLE_API_KEY`, `TAVILY_API_KEY`, `GITHUB_TOKEN`) but is instructed to never state or guess their values.
+- **File creation/modification (Phase 6) is controlled and human-approved, never blind.** `propose_file_change` validates the path (same project-root/excluded/blocked-file rules as `read_project_file`) and only ever registers a pending change — it cannot write to disk. `apply_approved_change` re-validates path safety independently and refuses to write anything unless `workflow.approve_change()` has already been called for that exact `change_id` — and that function is only ever called from the human-facing Streamlit sidebar (Approve/Reject buttons) or CLI approval prompt, never from a tool the agent itself can call. Asking the assistant to "skip approval" or "apply it directly" does not bypass this: the system prompt refuses, and even if it didn't, the tool itself would still refuse. There is still no tool that can delete a file.
 
 ## Testing
 
@@ -313,18 +355,23 @@ Or ask the assistant directly in the chat: *"Run the tests."*
 
 Tests mock the LangChain agent object where relevant (`ask_agent`'s tool-call extraction) so the suite never depends on a live Gemini API call or a configured API key. `run_ruff`/`run_black`/`check_python_syntax` are tested against real inputs since they're safe, read-only/stdin-only/parse-only operations. `run_pytest` (`tests/test_execution_tools.py`) is tested by mocking `subprocess.run` instead of actually invoking it, since a real call would recursively re-run this whole suite as a subprocess — the mock still verifies real stdout/stderr capture, exit-code handling, the configured timeout, and error handling (missing executable, missing `tests/` folder). The Phase 4 tools are tested the same way `ask_agent` is — by mocking at the external-service boundary (`tools.TavilyClient`, `tools._get_repo`, `tools._get_github_client`) so the suite never makes a real network call, never needs a real `TAVILY_API_KEY`/`GITHUB_TOKEN`, and never needs a real `git` executable installed.
 
-## Version 5 Ideas (not implemented)
+`documents.py` (`tests/test_documents.py`) is tested against real parsers (`pypdf`, `python-docx`) with in-memory files built and torn down inside the test, plus the same secret-redaction assertions used elsewhere. `workflow.py` (`tests/test_workflow.py`) and the Phase 6 tools (`tests/test_dev_tools.py`) are tested directly — including that `apply_approved_change` genuinely refuses to write an unapproved change and that approving one `change_id` never approves another. `tests/test_app.py` drives the real `app.py` script headlessly via Streamlit's own `AppTest` (with `ask_agent`/`transcribe_audio` mocked), so the attachment/voice/Phase 6 approval UI wiring is exercised end-to-end without a browser or a live API call.
 
-These are intentionally left out to keep this project simple and easy to learn from — Phase 5 is about *controlled, verifiable* execution and error analysis, not autonomous software development:
+## Ideas Not Implemented
+
+These are intentionally left out to keep this project's autonomy controlled and easy to reason about:
 
 - Sandboxed/unrestricted code execution or a generic "run any command" tool
-- Automatic file editing / autonomous fix application (the assistant explains fixes; it does not apply them)
-- Fully autonomous test/fix/re-run loops that require no human review
-- RAG (retrieval-augmented generation) / vector databases
-- Multi-agent architectures / LangGraph
+- Fully autonomous, unattended file changes that skip human approval
+- An interrupt that can force-stop a tool call already in flight mid-turn (the repair-attempt limit is now enforced in code, but only between tool calls - `apply_approved_change` checks the tally before it writes, not while some other, unrelated call is still running)
+- A live, per-call streaming workflow-status feed (today's `[WORKFLOW]` trail is derived from a turn's tool calls after `agent.invoke()` already completed - accurate, but not real-time; see the Phase 6 honest-scope note above)
+- Fully reliable cross-turn reuse of a specific proposed change_id (the model has `list_pending_changes` to check the ground truth now, but can still occasionally re-propose a fresh change instead of calling it first - the approval gate and the repair-attempt tally both still hold either way)
+- Deleting files, or any destructive filesystem operation
+- RAG (retrieval-augmented generation) / vector databases — document context uses direct inclusion with truncation, not chunking/embeddings
+- Multi-agent architectures / a custom LangGraph orchestrator (Phase 6 reuses the existing single-agent `create_agent` tool-calling loop)
 - Automatic Git operations (commit, push, branch create/delete, reset, clean)
 - Automatic GitHub operations (creating/closing/commenting on issues or PRs, merging)
-- File upload / analysis
-- Persistent long-term memory / database
+- Automatic deployment
+- Persistent long-term memory / database (the Phase 6 pending-change registry is in-memory and process-local, not durable storage)
 - Docker / cloud deployment
-- User accounts / authentication
+- User accounts / authentication / multi-user support (this app assumes one local, single-user session)

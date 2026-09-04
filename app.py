@@ -15,6 +15,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import documents
+import workflow
 from agent import (
     ask_agent,
     build_agent,
@@ -195,6 +196,29 @@ AI_FEATURES_INFO = {
         ],
         "example": "Run the project tests and explain any failures.",
     },
+    "Phase 6 — Autonomous Software Development": {
+        "summary": (
+            "Allows the AI to carry out multi-step development tasks "
+            "(plan, inspect, implement, test, review) with controlled, "
+            "human-approved file changes."
+        ),
+        "features": [
+            "Task planning and decomposition",
+            "Autonomous tool selection",
+            "Controlled file creation/modification",
+            "Human approval before any file is written",
+            "PDF requirements → project generation",
+            "Test → analyze → fix → retest loop (capped retries)",
+            "Regression testing",
+            "Git-aware development (read-only)",
+            "Workflow state tracking",
+            "Security restrictions",
+        ],
+        "example": (
+            "Ask the AI to add a feature or fix a bug - it will propose a plan and "
+            "file changes, and only apply them once you approve."
+        ),
+    },
 }
 
 TOOL_DISPLAY_NAMES = {
@@ -216,6 +240,9 @@ TOOL_DISPLAY_NAMES = {
     "github_get_repository": "🐙 Looking Up GitHub Repository",
     "github_get_issues": "🐙 Fetching GitHub Issues",
     "github_get_pull_requests": "🐙 Fetching GitHub Pull Requests",
+    "propose_file_change": "📝 Proposing File Change",
+    "apply_approved_change": "✅ Applying Approved Change",
+    "list_pending_changes": "🔧 Checking Pending Changes",
 }
 
 # Quick Actions: an optional prefix prepended to the message sent to the
@@ -302,6 +329,17 @@ def render_tts_button(text: str, key: str) -> None:
         )
 
 
+def render_workflow_states(states: list[str]) -> None:
+    """Show the Phase 6 workflow-status trail for one turn (e.g.
+    'Workflow: IMPLEMENTING -> WAITING FOR APPROVAL'), derived from which
+    tools were actually called - purely descriptive, shown only when at
+    least one Phase 6-relevant tool ran this turn."""
+    if not states:
+        return
+    trail = " → ".join(state.replace("_", " ") for state in states)
+    st.caption(f"🔧 Workflow: {trail}")
+
+
 def render_tool_box(tool_call: dict) -> None:
     """Render a single '🔧 Using X Tool' box for one tool call."""
     name = tool_call["name"]
@@ -315,6 +353,12 @@ def render_tool_box(tool_call: dict) -> None:
     elif name in ("run_ruff", "run_black"):
         target = tool_call["input"].get("file_path") or "pasted code"
         body = f"**Target:** `{target}`<br>{_output_block(tool_call['output'])}"
+    elif name == "propose_file_change":
+        target = tool_call["input"].get("file_path", "")
+        body = f"**File:** `{target}`<br>{_output_block(tool_call['output'])}"
+    elif name == "apply_approved_change":
+        change_id = tool_call["input"].get("change_id", "")
+        body = f"**Change ID:** `{change_id}`<br>{_output_block(tool_call['output'])}"
     else:
         body = _output_block(tool_call["output"])
 
@@ -371,7 +415,8 @@ with st.sidebar:
         "✓ GitHub Issues/PRs\n\n"
         "✓ Commit Message Generation\n\n"
         "✓ 🎤 Voice Assistant\n\n"
-        "✓ 📎 Document Analysis"
+        "✓ 📎 Document Analysis\n\n"
+        "✓ 🔧 Autonomous Development (Phase 6)"
     )
 
     st.markdown("## 🎯 Quick Actions")
@@ -399,6 +444,68 @@ with st.sidebar:
         st.caption(
             "No files attached. Use the 📎 icon in the chat box below to attach one."
         )
+
+    st.divider()
+    st.markdown("## 🔧 Pending Approvals")
+    st.caption(
+        "Phase 6: file changes the AI has proposed. Nothing is written to "
+        "disk until you approve it here."
+    )
+    pending_changes = workflow.list_pending_changes()
+    if pending_changes:
+        for change in pending_changes:
+            risk_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
+                change.risk, "🟡"
+            )
+            with st.expander(
+                f"{risk_icon} {change.action} · {change.file_path} "
+                f"(id: {change.change_id})"
+            ):
+                st.markdown(f"**Reason:** {change.reason}")
+                st.markdown(f"**Risk:** {change.risk}")
+                st.code(change.content, language="python")
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    if st.button(
+                        "✅ Approve",
+                        key=f"approve_{change.change_id}",
+                        use_container_width=True,
+                    ):
+                        workflow.approve_change(change.change_id)
+                        st.rerun()
+                with reject_col:
+                    if st.button(
+                        "❌ Reject",
+                        key=f"reject_{change.change_id}",
+                        use_container_width=True,
+                    ):
+                        workflow.reject_change(change.change_id)
+                        st.rerun()
+                if change.approved:
+                    st.success(
+                        "Approved - ask the assistant to apply it "
+                        f"(change id `{change.change_id}`)."
+                    )
+    else:
+        st.caption(
+            "No pending changes. Ask the AI to add/fix/refactor something to see one here."
+        )
+
+    stuck_files = [
+        file_path
+        for file_path, count in workflow.repair_attempts_snapshot().items()
+        if count >= workflow.MAX_REPAIR_ATTEMPTS
+    ]
+    if stuck_files:
+        st.warning(
+            "🛑 Repair-attempt limit reached for: "
+            + ", ".join(f"`{f}`" for f in stuck_files)
+            + ". The AI can no longer apply further automatic fixes to these files "
+            "until you reset the counter below."
+        )
+        if st.button("🔄 Reset repair counter", use_container_width=True):
+            workflow.reset_repair_attempts()
+            st.rerun()
 
     st.divider()
     st.markdown("## 🤖 AI Features")
@@ -471,6 +578,8 @@ if not st.session_state.messages:
         "✍️ Code Generation · 🐞 Debugging · 🔍 Code Review · ♻️ Refactoring\n\n"
         "🧪 Test Generation · ✅ Pytest · 🔎 Ruff · 🎨 Black\n\n"
         "🎤 Voice Questions · 📎 Document Upload (code, text, PDF, DOCX)\n\n"
+        "🔧 Multi-step development tasks (Phase 6) - the AI plans, proposes file "
+        "changes, and waits for your approval in the sidebar before applying them\n\n"
         "Pick a **Quick Action** in the sidebar, or just ask naturally - "
         'try *"Write a Python function to check whether a number is prime."*'
     )
@@ -485,6 +594,7 @@ for index, message in enumerate(st.session_state.messages):
             render_tool_box(tool_call)
         if message["role"] == "assistant":
             render_answer(message["content"])
+            render_workflow_states(message.get("workflow_states", []))
             render_tts_button(message["content"], key=f"tts_history_{index}")
         else:
             if message.get("source") == "voice":
@@ -609,18 +719,26 @@ if user_input:
                 result = ask_agent(agent, st.session_state.lc_history)
                 answer = result["answer"]
                 tool_calls = result["tool_calls"]
+                workflow_states = result.get("workflow_states", [])
             except Exception as exc:  # noqa: BLE001
                 print(f"[agent error] {exc}")
                 answer = "⚠️ I couldn't process that request. Please check your API key or try again."
                 tool_calls = []
+                workflow_states = []
 
         for tool_call in tool_calls:
             render_tool_box(tool_call)
 
         render_answer(answer)
+        render_workflow_states(workflow_states)
         render_tts_button(answer, key=f"tts_live_{len(st.session_state.messages)}")
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "tool_calls": tool_calls}
+        {
+            "role": "assistant",
+            "content": answer,
+            "tool_calls": tool_calls,
+            "workflow_states": workflow_states,
+        }
     )
     st.session_state.lc_history.append(new_ai_message(answer))

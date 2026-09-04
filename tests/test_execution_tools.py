@@ -10,8 +10,18 @@ out or executes anything, it only parses source text with `ast`.
 
 import subprocess
 
+import pytest
+
 import tools
+import workflow
 from tools import PROJECT_ROOT, check_python_syntax, run_pytest
+
+
+@pytest.fixture(autouse=True)
+def _clean_repair_state():
+    workflow.reset_repair_attempts()
+    yield
+    workflow.reset_repair_attempts()
 
 
 class _FakeCompletedProcess:
@@ -51,6 +61,31 @@ def test_run_pytest_reports_actual_failure_summary(monkeypatch):
     assert "Exit code: 1" in result
     assert "FAILED tests/test_math.py::test_add" in result
     assert "1 failed, 2 passed" in result
+
+
+def test_run_pytest_passing_clears_repair_attempts(monkeypatch):
+    workflow.record_apply("some_file.py")
+    assert workflow.repair_attempts_for("some_file.py") == 1
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess(stdout="3 passed in 0.10s\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_pytest.invoke({})
+    assert workflow.repair_attempts_for("some_file.py") == 0
+
+
+def test_run_pytest_failing_does_not_clear_repair_attempts(monkeypatch):
+    workflow.record_apply("some_file.py")
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess(
+            stdout="1 failed, 2 passed in 0.10s\n", returncode=1
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_pytest.invoke({})
+    assert workflow.repair_attempts_for("some_file.py") == 1
 
 
 def test_run_pytest_captures_stderr(monkeypatch):

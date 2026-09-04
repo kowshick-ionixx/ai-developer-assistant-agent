@@ -15,7 +15,21 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import workflow
+
 _APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
+
+
+@pytest.fixture(autouse=True)
+def _clean_workflow_registry():
+    """Phase 6's pending-change registry and repair-attempt tallies are
+    process-wide module-level stores (see workflow.py) - reset them around
+    every test in this file."""
+    workflow.clear_all_changes()
+    workflow.reset_repair_attempts()
+    yield
+    workflow.clear_all_changes()
+    workflow.reset_repair_attempts()
 
 
 @pytest.fixture
@@ -281,3 +295,160 @@ def test_expanding_ai_features_panel_does_not_touch_chat_or_pending_prompt(
 
     assert at.session_state["messages"] == messages_before
     assert at.session_state["pending_prompt"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Pending Approvals sidebar (propose -> human approve/reject -> apply)
+# ---------------------------------------------------------------------------
+
+
+def test_no_pending_changes_shows_empty_state(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    markdown_text = "\n".join(m.value for m in at.sidebar.markdown)
+    caption_text = "\n".join(c.value for c in at.sidebar.caption)
+    assert "No pending changes" in markdown_text + caption_text
+
+
+def test_pending_change_appears_in_sidebar_with_approve_reject_buttons(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+    assert at.exception == []
+
+    expander_labels = [e.label for e in at.sidebar.expander]
+    assert any(change.change_id in label for label in expander_labels)
+
+    matching_expander = next(
+        e for e in at.sidebar.expander if change.change_id in e.label
+    )
+    button_labels = {b.label for b in matching_expander.button}
+    assert "✅ Approve" in button_labels
+    assert "❌ Reject" in button_labels
+
+
+def test_clicking_approve_sets_change_approved(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+
+    matching_expander = next(
+        e for e in at.sidebar.expander if change.change_id in e.label
+    )
+    approve_btn = next(b for b in matching_expander.button if b.label == "✅ Approve")
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert workflow.get_change(change.change_id).approved is True
+
+
+def test_clicking_reject_removes_pending_change(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+
+    matching_expander = next(
+        e for e in at.sidebar.expander if change.change_id in e.label
+    )
+    reject_btn = next(b for b in matching_expander.button if b.label == "❌ Reject")
+    reject_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert workflow.get_change(change.change_id) is None
+    assert workflow.list_pending_changes() == []
+
+
+def test_approving_a_change_does_not_touch_conversation_or_other_state(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    at.chat_input[0].set_value("What is Python?").run(timeout=30)
+    messages_before = list(at.session_state["messages"])
+
+    change = workflow.register_change(
+        file_path="demo.py", action="create", content="x = 1\n", reason="demo"
+    )
+    at.run(timeout=30)
+    matching_expander = next(
+        e for e in at.sidebar.expander if change.change_id in e.label
+    )
+    approve_btn = next(b for b in matching_expander.button if b.label == "✅ Approve")
+    approve_btn.click()
+    at.run(timeout=30)
+
+    assert at.session_state["messages"] == messages_before
+
+
+def test_workflow_states_are_displayed_when_present(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+
+    import agent as agent_module
+
+    def fake_ask_agent_with_workflow(agent, history):
+        return {
+            "answer": "Done.",
+            "tool_calls": [],
+            "workflow_states": ["IMPLEMENTING", "WAITING_FOR_APPROVAL"],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent_with_workflow)
+    at.chat_input[0].set_value("Add a feature").run(timeout=30)
+    assert at.exception == []
+
+    last_message = at.session_state["messages"][-1]
+    assert last_message["workflow_states"] == ["IMPLEMENTING", "WAITING_FOR_APPROVAL"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: repair-attempt circuit breaker reset control
+# ---------------------------------------------------------------------------
+
+
+def test_no_repair_warning_when_no_file_has_hit_the_limit(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    warning_text = "\n".join(w.value for w in at.sidebar.warning)
+    assert "repair-attempt limit" not in warning_text.lower()
+    reset_buttons = [b for b in at.sidebar.button if "Reset repair counter" in b.label]
+    assert reset_buttons == []
+
+
+def test_repair_warning_and_reset_button_appear_once_limit_reached(
+    apptest_with_mocked_agent,
+):
+    at = apptest_with_mocked_agent
+    for _ in range(workflow.MAX_REPAIR_ATTEMPTS):
+        workflow.record_apply("stuck_file.py")
+    at.run(timeout=30)
+    assert at.exception == []
+
+    warning_text = "\n".join(w.value for w in at.sidebar.warning)
+    assert "repair-attempt limit" in warning_text.lower()
+    assert "stuck_file.py" in warning_text
+
+    reset_buttons = [b for b in at.sidebar.button if "Reset repair counter" in b.label]
+    assert len(reset_buttons) == 1
+
+
+def test_clicking_reset_repair_counter_clears_the_tally(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    for _ in range(workflow.MAX_REPAIR_ATTEMPTS):
+        workflow.record_apply("stuck_file.py")
+    at.run(timeout=30)
+
+    reset_btn = next(b for b in at.sidebar.button if "Reset repair counter" in b.label)
+    reset_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert workflow.repair_attempts_for("stuck_file.py") == 0

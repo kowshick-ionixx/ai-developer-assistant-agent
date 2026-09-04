@@ -95,6 +95,31 @@ def log_user_input(text: str) -> None:
     _section("USER INPUT", _truncate(sanitize(text), _INPUT_TRUNCATE_LIMIT))
 
 
+def log_phase6_task_received(task: str) -> None:
+    _section(
+        "PHASE 6", f"Task received: {_truncate(sanitize(task), _INPUT_TRUNCATE_LIMIT)}"
+    )
+
+
+def log_planner_result(steps: list[str]) -> None:
+    body = (
+        "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+        or "(no plan)"
+    )
+    _section("PLANNER", body)
+
+
+def log_workflow_state(state: str) -> None:
+    _section("WORKFLOW", f"State: {state}")
+
+
+def log_approval_waiting(change_id: str, file_path: str) -> None:
+    _section(
+        "APPROVAL",
+        f"Waiting for user approval - change_id={change_id} file={file_path}",
+    )
+
+
 def log_agent_start() -> None:
     _section("AGENT", "Processing request...")
 

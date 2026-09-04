@@ -20,6 +20,7 @@ from agent import (
     _extract_text,
     ask_agent,
     build_agent,
+    create_plan,
     get_api_key,
     new_ai_message,
     new_human_message,
@@ -381,3 +382,180 @@ def test_ask_agent_extracts_git_diff_tool_call():
     assert result["tool_calls"] == [
         {"name": "git_diff", "input": {"file_path": ""}, "output": diff_output}
     ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: task planner (create_plan) and controlled-development tool wiring
+# ---------------------------------------------------------------------------
+
+
+class _FakePlannerLLM:
+    """Stands in for ChatGoogleGenerativeAI so create_plan() tests never
+    call the real Gemini API."""
+
+    def __init__(self, response_text):
+        self.response_text = response_text
+        self.received_messages = None
+
+    def invoke(self, messages):
+        self.received_messages = messages
+        return AIMessage(content=self.response_text)
+
+
+def test_create_plan_parses_numbered_steps(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM(
+        "1. Inspect project structure\n"
+        "2. Find related files\n"
+        "3. Propose implementation\n"
+        "4. Run tests\n"
+    )
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    steps = create_plan("Add a login API")
+
+    assert steps == [
+        "Inspect project structure",
+        "Find related files",
+        "Propose implementation",
+        "Run tests",
+    ]
+
+
+def test_create_plan_strips_bullet_and_dash_markers(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("- Inspect project\n* Propose change\n")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    steps = create_plan("Fix a bug")
+
+    assert steps == ["Inspect project", "Propose change"]
+
+
+def test_create_plan_ignores_blank_lines(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("1. Step one\n\n\n2. Step two\n")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    steps = create_plan("Refactor code")
+
+    assert steps == ["Step one", "Step two"]
+
+
+def test_create_plan_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(ValueError):
+        create_plan("Add a feature")
+
+
+def test_create_plan_does_not_build_the_full_tool_using_agent(monkeypatch):
+    # The planner previews a plan for the user - it must not itself spin up
+    # a second, separate tool-using agent.
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    fake_llm = _FakePlannerLLM("1. Inspect project\n")
+    monkeypatch.setattr(
+        agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("create_plan must not build a tool-using agent")
+
+    monkeypatch.setattr(agent_module, "create_agent", _fail_if_called)
+
+    create_plan("Add a feature")
+
+
+def test_phase_6_dev_tools_are_registered():
+    tool_names = {t.name for t in TOOLS}
+    assert {
+        "propose_file_change",
+        "apply_approved_change",
+        "list_pending_changes",
+    } <= tool_names
+
+
+def test_system_prompt_covers_phase_6_controlled_development():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "propose_file_change" in prompt_lower
+    assert "apply_approved_change" in prompt_lower
+    assert "approv" in prompt_lower  # "approval"/"approved"/"approve"
+    assert "repair cycles" in prompt_lower or "max" in prompt_lower
+
+
+def test_system_prompt_no_longer_claims_there_is_no_file_editing_tool():
+    # This claim was true before Phase 6 and is now false - the system
+    # prompt must not mislead the model (or the user) about this.
+    assert (
+        "no file-editing tool" not in SYSTEM_PROMPT.lower()
+    ), "SYSTEM_PROMPT still claims there is no file-editing tool"
+
+
+def test_system_prompt_has_request_classification_section():
+    """Regression test for the reported bug where a development request
+    containing math language (e.g. "add a function to calculate the
+    factorial of a number") was wrongly routed to the calculator tool
+    instead of the Phase 6 development workflow."""
+    assert "## Request Classification" in SYSTEM_PROMPT
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "calculation:" in prompt_lower
+    assert "development:" in prompt_lower
+    assert "development + testing" in prompt_lower
+    assert "development + testing + verification" in prompt_lower
+
+
+def test_system_prompt_classification_warns_against_keyword_matching():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "never let one keyword" in prompt_lower
+    assert "calculate the factorial of a number" in prompt_lower
+
+
+def test_system_prompt_forbids_fake_verified_claims():
+    """Regression test for the observed fabrication: the agent printed code
+    as plain chat text (never calling propose_file_change), then called
+    run_pytest against the unrelated existing suite and claimed "All tests
+    passed successfully" - implying the new feature/tests had been verified
+    when nothing was actually created or tested."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "never fabricate a" in prompt_lower
+    assert "never write a fake terminal transcript" in prompt_lower
+    assert "must call propose_file_change" in prompt_lower
+
+
+def test_system_prompt_phase6_requires_propose_for_new_code_and_tests():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "the feature itself and any tests for it" in prompt_lower
+    assert "showing code without calling propose_file_change" in prompt_lower
+
+
+def test_system_prompt_forbids_truncating_modified_files():
+    """Regression test for a real failure observed in live testing: the
+    model proposed a "modify" of tools.py that silently cut off most of the
+    file with a placeholder comment instead of reproducing it in full."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "must be the entire file with your change applied" in prompt_lower
+    assert "rest of file omitted" in prompt_lower
+    assert "relay that warning to the user verbatim" in prompt_lower
+
+
+def test_system_prompt_documents_list_pending_changes():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "list_pending_changes" in prompt_lower
+    assert (
+        "check the real current state" in prompt_lower
+        or "check for an existing" in (prompt_lower)
+    )
+
+
+def test_system_prompt_describes_repair_limit_as_real_not_a_guideline():
+    """Regression test: MAX_REPAIR_ATTEMPTS is now a real, code-enforced
+    limit (apply_approved_change refuses further writes), not just a
+    system-prompt suggestion - the prompt must say so accurately."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "real, enforced" in prompt_lower or "real limit" in prompt_lower
+    assert "not just a guideline" in prompt_lower or "not just a" in prompt_lower

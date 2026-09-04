@@ -6,7 +6,7 @@ when it decides it needs help with something the language model can't (or
 shouldn't) do on its own, like exact arithmetic or running an external
 command-line program.
 
-This file defines eighteen tools:
+This file defines twenty-one tools:
     1. calculator             -> evaluates a math expression safely
     2. explain_python_code    -> analyzes Python code structure (never runs it)
     3. run_pytest              -> runs this project's own test suite
@@ -25,6 +25,9 @@ This file defines eighteen tools:
     16. github_get_repository -> looks up a GitHub repository's info
     17. github_get_issues     -> lists a GitHub repository's issues
     18. github_get_pull_requests -> lists a GitHub repository's pull requests
+    19. propose_file_change   -> (Phase 6) registers a pending file create/modify - never writes
+    20. apply_approved_change -> (Phase 6) writes a change, but only once a human has approved it
+    21. list_pending_changes  -> (Phase 6) lists proposed changes and their real change_id/approval state
 
 Code generation, debugging, review, and refactoring are handled by Gemini's
 own reasoning (guided by the system prompt in agent.py) rather than by tools
@@ -101,6 +104,34 @@ Safety notes for list_project_files/read_project_file/search_project:
       rejected, even if a caller asks for them by name.
     - Noise/third-party folders (venv, .git, __pycache__, dependency and
       tool caches) are excluded from listings, reads, and search results.
+
+Safety notes for propose_file_change/apply_approved_change (Phase 6):
+    - propose_file_change NEVER writes to disk - it only validates the
+      target path (same project-root/excluded/blocked-file checks as
+      read_project_file) and registers a pending ProposedChange in
+      workflow.py, returning its change_id.
+    - apply_approved_change is the only tool that can actually write a
+      file, and only for a change_id whose ProposedChange.approved flag is
+      already True. That flag can only be set by workflow.approve_change(),
+      which is called exclusively from the human-facing Streamlit/CLI
+      approval UI - there is no tool the agent itself can call to approve
+      its own change, so this is a real structural gate, not just a prompt
+      instruction.
+    - Both re-run the exact same path-safety checks as the other file
+      tools, so a proposed change can never target .env, another
+      credential-like file, or anything outside the project root.
+    - apply_approved_change also enforces a real, code-level repair-attempt
+      circuit breaker (workflow.py's per-file counter): once a file has been
+      applied MAX_REPAIR_ATTEMPTS times without an intervening passing
+      run_pytest result, further applies to that file are refused until a
+      human either sees the suite pass or explicitly resets the counter -
+      this is a hard limit the agent cannot lift itself, not just a
+      system-prompt instruction.
+    - list_pending_changes is read-only (it never writes, approves, or
+      rejects anything) and lets the agent check the real current state of
+      proposed changes across turns, instead of relying on its own memory
+      of an earlier turn (which can be unreliable) or inventing a
+      change_id.
 """
 
 import ast
@@ -136,6 +167,16 @@ from logger import (
     log_tool_input,
     log_tool_result,
 )
+from workflow import (
+    get_change,
+    mark_applied,
+    record_apply,
+    record_test_outcome,
+    register_change,
+)
+from workflow import list_pending_changes as _list_pending_changes
+from workflow import repair_attempts_for as _repair_attempts_for
+from workflow import repair_limit_reached as _repair_limit_reached
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 _SUBPROCESS_TIMEOUT_SECONDS = 60
@@ -279,10 +320,19 @@ def safe_calculate(expression: str) -> float | int:
 def calculator(expression: str) -> str:
     """Evaluate a basic math expression and return the numeric result.
 
-    Use this whenever the user asks you to calculate, compute, or work out a
-    math problem, e.g. "125 * 48", "(20 + 5) * 4", "100 / 5", or "2 ** 10".
-    Supports + - * / // % ** and parentheses. Do not use it for anything
-    other than arithmetic.
+    Use this ONLY when the user wants a numeric answer computed right now,
+    e.g. "125 * 48", "(20 + 5) * 4", "100 / 5", "2 ** 10", or "calculate 5
+    factorial". Supports + - * / // % ** and parentheses.
+
+    Do NOT use this for a software-development request that merely mentions
+    a math concept - e.g. "add/write/create a function that calculates the
+    factorial of a number", "implement a prime-checking function", or "add a
+    function to calculate the factorial of a number, create pytest tests for
+    it, run the tests, and verify everything works". Those are development
+    tasks (write/propose code, not compute one number) even though they
+    contain words like "calculate" or "factorial" - see the system prompt's
+    Request Classification section. Do not use this tool for anything other
+    than directly evaluating one arithmetic expression.
     """
     log_tool_call("calculator")
     expression = expression.strip()
@@ -487,6 +537,7 @@ def run_pytest() -> str:
     output = (result.stdout + "\n" + result.stderr).strip()
     log_tool_result(output)
     log_exit_code(result.returncode)
+    record_test_outcome(result.returncode == 0)
     return f"Exit code: {result.returncode}\n\n{output}"
 
 
@@ -1551,5 +1602,202 @@ def github_get_pull_requests(repo_full_name: str = "", state: str = "open") -> s
         for pr in pulls
     ]
     result = "\n".join(lines)
+    log_tool_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: controlled file creation/modification (propose -> human approval
+# -> apply). See workflow.py for the ProposedChange/registry this uses.
+# ---------------------------------------------------------------------------
+
+
+@tool
+def propose_file_change(file_path: str, new_content: str, reason: str) -> str:
+    """Propose creating or modifying a project file. This NEVER writes
+    anything - it only registers a pending change that a human must
+    explicitly approve (via the Streamlit UI's Approve button or the CLI's
+    approval prompt) before apply_approved_change can write it.
+
+    Use this for ANY file creation or modification the user asks for -
+    never claim a file was created or changed without going through this
+    approval flow first, and never call apply_approved_change for a change
+    that hasn't been approved.
+
+    `file_path` is relative to the project root (e.g. "auth.py",
+    "tests/test_auth.py"). `new_content` is the complete proposed file
+    content (not a diff). `reason` is a one-line explanation of why this
+    change is needed. Rejects paths outside the project, the .env file and
+    other credential-like files, and anything inside venv/.git/cache
+    folders - the same rules read_project_file uses.
+    """
+    log_tool_call("propose_file_change")
+    file_path = file_path.strip()
+    log_tool_input(f"file_path={file_path!r} reason={reason!r}")
+    if not file_path:
+        result = "Error: no file_path was provided."
+        log_tool_result(result)
+        return result
+
+    safe_path = _resolve_safe_path(file_path)
+    if safe_path is None:
+        result = f"Error: '{file_path}' is outside the project directory and cannot be modified."
+        log_tool_result(result)
+        return result
+    if _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+        result = f"Error: '{file_path}' cannot be modified for security reasons."
+        log_tool_result(result)
+        return result
+
+    log_tool_execution("Registering proposed change (not yet written)...")
+    action = "modify" if safe_path.exists() else "create"
+
+    # Defense in depth: a "modify" proposal that is drastically shorter than
+    # the file it replaces is a strong sign the model truncated the file
+    # instead of reproducing it in full (e.g. cutting it short with a
+    # placeholder comment like "... rest of file omitted for brevity") -
+    # observed in real testing. propose_file_change never writes anything by
+    # itself, but a human approving a change in the UI has no way to notice a
+    # silent truncation just from a short reason/summary, so this is flagged
+    # as high risk with an explicit warning rather than silently registered
+    # at the default risk level.
+    risk = "medium"
+    warning = ""
+    if action == "modify":
+        try:
+            existing_length = len(safe_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            existing_length = 0
+        new_length = len(new_content)
+        if existing_length > 200 and new_length < existing_length * 0.6:
+            risk = "high"
+            warning = (
+                f"\n\nWARNING: the proposed content ({new_length} characters) is "
+                f"much shorter than the current file ({existing_length} characters). "
+                "This often means part of the existing file was left out by mistake "
+                "(e.g. truncated with a placeholder comment) rather than an "
+                "intentional rewrite. Review the full proposed content carefully "
+                "before approving - do not approve this without checking that "
+                "nothing important was dropped."
+            )
+
+    change = register_change(
+        file_path=file_path,
+        action=action,
+        content=new_content,
+        reason=reason,
+        risk=risk,
+    )
+    result = (
+        f"Proposed change registered: id={change.change_id}, action={action}, "
+        f"file={file_path}, risk={risk}.\n"
+        f"Reason: {reason}"
+        f"{warning}\n\n"
+        "This change has NOT been written to disk. Tell the user the change id "
+        f"and what it does{' and relay the warning above' if warning else ''}, "
+        f"and ask them to approve it before you call "
+        f"apply_approved_change(change_id='{change.change_id}')."
+    )
+    log_tool_result(result)
+    return result
+
+
+@tool
+def apply_approved_change(change_id: str) -> str:
+    """Write a previously proposed file change to disk - but ONLY if a
+    human has already approved it via the Streamlit UI's Approve button or
+    the CLI's approval prompt.
+
+    This refuses to write anything for a change_id that has not been
+    explicitly approved, even if the user's message asks you to apply it -
+    approval must come from the actual UI/CLI approval action, not just
+    from being asked. Re-validates the same path-safety rules as
+    propose_file_change before writing.
+    """
+    log_tool_call("apply_approved_change")
+    change_id = change_id.strip()
+    log_tool_input(f"change_id={change_id!r}")
+
+    change = get_change(change_id)
+    if change is None:
+        result = f"Error: no pending change found with id '{change_id}'."
+        log_tool_result(result)
+        return result
+    if not change.approved:
+        result = (
+            f"Error: change '{change_id}' has not been approved yet. It cannot be "
+            "applied until the user approves it in the UI."
+        )
+        log_tool_result(result)
+        return result
+
+    safe_path = _resolve_safe_path(change.file_path)
+    if safe_path is None or _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+        result = f"Error: '{change.file_path}' cannot be modified for security reasons."
+        log_tool_result(result)
+        return result
+
+    # Real, code-level circuit breaker (not just a system-prompt policy): a
+    # file that has already been applied MAX_REPAIR_ATTEMPTS times without
+    # an intervening passing run_pytest is a stuck repair loop, so refuse to
+    # write it again until a human either sees the suite pass or explicitly
+    # resets the counter - the agent itself has no way to lift this limit.
+    if _repair_limit_reached(change.file_path):
+        result = (
+            f"Error: '{change.file_path}' has already been applied "
+            f"{_repair_attempts_for(change.file_path)} times without a passing "
+            "run_pytest result in between - the repair-attempt limit has been "
+            "reached. Stop retrying automatically and tell the user testing is "
+            "still failing after repeated fixes, so they can decide how to "
+            "proceed (a human can reset this limit for this file)."
+        )
+        log_tool_result(result)
+        return result
+
+    log_tool_execution(f"Writing approved change {change_id}...")
+    try:
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_path.write_text(change.content, encoding="utf-8")
+    except OSError as exc:
+        log_error("apply_approved_change", str(exc))
+        result = f"Error: could not write '{change.file_path}' ({exc})."
+        log_tool_result(result)
+        return result
+
+    mark_applied(change.change_id)
+    record_apply(change.file_path)
+    result = (
+        f"Applied change {change.change_id}: {change.action}d '{change.file_path}'."
+    )
+    log_tool_result(result)
+    return result
+
+
+@tool
+def list_pending_changes() -> str:
+    """List every currently pending (proposed but not yet applied) file
+    change, with its real change_id, action, file, approval status, and
+    risk level.
+
+    ALWAYS call this before proposing a new change for a file you may have
+    already proposed one for earlier in this conversation, and before
+    telling the user something "is still waiting for approval" or asking
+    them to approve a change again - check the real current state here
+    instead of relying on memory of an earlier turn. Only change_ids this
+    tool actually returns are real; never invent or reuse one from memory
+    without confirming it here first.
+    """
+    log_tool_call("list_pending_changes")
+    log_tool_input("(no arguments)")
+    changes = _list_pending_changes()
+    if not changes:
+        result = "No pending changes."
+    else:
+        lines = [
+            f"- change_id={c.change_id} action={c.action} file={c.file_path} "
+            f"approved={c.approved} risk={c.risk}"
+            for c in changes
+        ]
+        result = "Pending changes:\n" + "\n".join(lines)
     log_tool_result(result)
     return result

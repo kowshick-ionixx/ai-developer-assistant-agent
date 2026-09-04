@@ -47,6 +47,17 @@ def test_calculator_empty_expression():
     assert "error" in result.lower()
 
 
+def test_calculator_docstring_excludes_development_requests():
+    """Regression test: the calculator's docstring is what the LLM reads to
+    decide when to call it. A development request that merely mentions a math
+    concept (e.g. "add a function to calculate the factorial of a number")
+    must not read as a calculator trigger, or the model will wrongly call
+    calculator instead of proposing code."""
+    doc = calculator.func.__doc__.lower()
+    assert "do not use this for a software-development request" in doc
+    assert "factorial" in doc
+
+
 def test_explain_python_code_finds_structure():
     code = "for i in range(5):\n    print(i)"
     result = explain_python_code.invoke({"code": code})
