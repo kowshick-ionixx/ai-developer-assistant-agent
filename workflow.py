@@ -58,6 +58,8 @@ class WorkflowStatus(str, Enum):
     REVIEWING = "REVIEWING"
     WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
     COMPLETED = "COMPLETED"
+    PACKAGING = "PACKAGING"
+    LIVE_PREVIEW = "LIVE_PREVIEW"
     FAILED = "FAILED"
 
 
@@ -123,7 +125,12 @@ _ALLOWED_TRANSITIONS: dict[WorkflowStatus, set[WorkflowStatus]] = {
         WorkflowStatus.FAILED,
     },
     WorkflowStatus.REVIEWING: {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED},
-    WorkflowStatus.COMPLETED: set(),
+    # A verified project package (see tools.create_project_zip) is only ever
+    # offered once a task has genuinely reached COMPLETED - packaging can
+    # never happen instead of, or before, real completion.
+    WorkflowStatus.COMPLETED: {WorkflowStatus.PACKAGING, WorkflowStatus.LIVE_PREVIEW},
+    WorkflowStatus.PACKAGING: {WorkflowStatus.LIVE_PREVIEW},
+    WorkflowStatus.LIVE_PREVIEW: set(),
     WorkflowStatus.FAILED: set(),
 }
 
@@ -133,7 +140,12 @@ class ProposedChange:
     """One human-reviewable file create/modify proposal. `content` is the
     file's full proposed new text - never executed, only ever written
     verbatim to `file_path` by apply_approved_change(), and only after
-    `approved` is True."""
+    `approved` is True.
+
+    `changeset_id` groups every change proposed for the same development
+    task into one human-reviewable unit (see register_change) - the UI
+    approves/applies a whole changeset in one action, never one file at a
+    time."""
 
     change_id: str
     file_path: str
@@ -143,6 +155,7 @@ class ProposedChange:
     risk: str = "medium"  # "low" | "medium" | "high"
     approved: bool = False
     applied: bool = False
+    changeset_id: str = ""
 
 
 @dataclass
@@ -210,13 +223,43 @@ class WorkflowState:
 
 _pending_changes: dict[str, ProposedChange] = {}
 
+# The changeset a newly proposed change joins (see register_change) - the
+# single-user equivalent of "the development task currently in progress".
+# None only before the very first change is ever proposed.
+_current_changeset_id: str | None = None
+
+
+def _changeset_has_unapplied_member(changeset_id: str) -> bool:
+    """True if any change under `changeset_id` still isn't written to disk
+    (pending or approved-but-not-yet-applied) - i.e. the set is still "in
+    flight" and a human still has something to review/approve/apply for it."""
+    return any(
+        c.changeset_id == changeset_id and not c.applied
+        for c in _pending_changes.values()
+    )
+
 
 def register_change(
     file_path: str, action: str, content: str, reason: str, risk: str = "medium"
 ) -> ProposedChange:
     """Register a new proposed change and return it. Never writes to disk -
     callers (tools.py's propose_file_change) are responsible for path
-    safety checks before calling this."""
+    safety checks before calling this.
+
+    Joins the current changeset (the one every other still-in-flight
+    change belongs to, so one development task's several proposed files
+    are reviewed/approved/applied together as a single unit) if one exists,
+    or starts a brand new changeset if the previous one has nothing left
+    in flight (every prior member already applied, or none exist yet) -
+    e.g. a later fix proposal after a passing/failing test run always gets
+    its own fresh changeset and its own fresh approval, since by then the
+    earlier changeset's members are already applied.
+    """
+    global _current_changeset_id
+    if _current_changeset_id is None or not _changeset_has_unapplied_member(
+        _current_changeset_id
+    ):
+        _current_changeset_id = uuid.uuid4().hex[:8]
     change_id = uuid.uuid4().hex[:8]
     change = ProposedChange(
         change_id=change_id,
@@ -225,6 +268,7 @@ def register_change(
         content=content,
         reason=reason,
         risk=risk,
+        changeset_id=_current_changeset_id,
     )
     _pending_changes[change_id] = change
     return change
@@ -234,13 +278,80 @@ def get_change(change_id: str) -> ProposedChange | None:
     return _pending_changes.get(change_id)
 
 
+def get_current_changeset_id() -> str | None:
+    """The changeset_id a human should currently review/approve/apply, if
+    any change proposed so far is still in flight - None once every change
+    ever proposed has been applied (or rejected), so the UI can tell "there
+    is nothing to show" from "there is a change set to review" without
+    tracking anything of its own."""
+    if _current_changeset_id is not None and _changeset_has_unapplied_member(
+        _current_changeset_id
+    ):
+        return _current_changeset_id
+    return None
+
+
+def list_changeset(changeset_id: str) -> list[ProposedChange]:
+    """Every change ever registered under `changeset_id`, in registration
+    order - including already-applied members, so a caller can show a
+    complete change-set history even while some (but not all) of its
+    members have been applied."""
+    return [c for c in _pending_changes.values() if c.changeset_id == changeset_id]
+
+
+def approve_change_set(changeset_id: str) -> list[str]:
+    """Approve every not-yet-approved, not-yet-applied member of
+    `changeset_id` as a single human action - the change-set-level
+    equivalent of approve_change(), and the only approval operation the
+    Streamlit UI's single "Approve Changes" button ever calls (never a
+    per-file approve).
+
+    Returns the change_ids this call actually just approved - empty if the
+    whole set was already approved (or `changeset_id` has no unapplied
+    members at all), which callers should treat exactly like
+    approve_change() returning False: already handled, do not re-announce
+    or re-process this approval. Idempotent for the same reason
+    approve_change() is: each member's own approved/applied flag, not this
+    function, is the source of truth.
+    """
+    return [
+        c.change_id
+        for c in _pending_changes.values()
+        if c.changeset_id == changeset_id and approve_change(c.change_id)
+    ]
+
+
+def reject_change_set(changeset_id: str) -> list[str]:
+    """Discard every not-yet-applied member of `changeset_id` without ever
+    writing any of them - the change-set-level equivalent of
+    reject_change(), and the only rejection operation the Streamlit UI's
+    "Reject Changes" button calls (never a per-file reject). Returns the
+    change_ids actually removed."""
+    change_ids = [
+        c.change_id
+        for c in _pending_changes.values()
+        if c.changeset_id == changeset_id and not c.applied
+    ]
+    return [change_id for change_id in change_ids if reject_change(change_id)]
+
+
 def approve_change(change_id: str) -> bool:
-    """Mark a change approved. Only ever called from the human-facing UI
-    (app.py's Approve button) or CLI approval prompt - never exposed as a
-    tool the AI agent itself can call, so the agent can never approve its
-    own proposed change."""
+    """Move `change_id` from pending to approved. Only ever called from the
+    human-facing UI (app.py's Approve button) or CLI approval prompt - never
+    exposed as a tool the AI agent itself can call, so the agent can never
+    approve its own proposed change.
+
+    Idempotent: returns True only the first time this specific change
+    actually makes the pending -> approved transition. An unknown change_id,
+    or one that is already approved or already applied, returns False and
+    changes nothing - so a duplicate approval action (a second click on an
+    already-approved card, or a Streamlit rerun that re-delivers the same
+    click) is safely ignored instead of re-triggering approval a second
+    time. Callers should treat a False return as "already handled, do not
+    re-announce or re-process this approval."
+    """
     change = _pending_changes.get(change_id)
-    if change is None:
+    if change is None or change.approved or change.applied:
         return False
     change.approved = True
     return True
@@ -264,7 +375,9 @@ def mark_applied(change_id: str) -> None:
 
 def clear_all_changes() -> None:
     """Discard every pending change without applying any of them."""
+    global _current_changeset_id
     _pending_changes.clear()
+    _current_changeset_id = None
 
 
 # ---------------------------------------------------------------------------

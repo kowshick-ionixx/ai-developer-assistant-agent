@@ -69,6 +69,21 @@ _GITHUB_TOKEN_RE = re.compile(
 )
 _TAVILY_KEY_RE = re.compile(r"\btvly-[0-9A-Za-z_\-]{10,}\b")
 
+# Deliberately stricter than _KEY_VALUE_RE above: requires the assigned
+# value to itself be a quoted, sufficiently long literal (e.g.
+# `API_KEY = "abcd1234..."'`), not just any assignment to a plausibly-named
+# variable. `_KEY_VALUE_RE` is tuned for redacting already-suspicious tool
+# output/pasted text, where matching on the name alone is the right
+# trade-off; scanning arbitrary real source code with that same loose
+# pattern would flag completely ordinary code such as
+# `api_key = os.getenv("GOOGLE_API_KEY")` or `token = get_token()` (the
+# value is a call/expression, never a quoted literal) - see
+# contains_probable_secret's docstring.
+_HARDCODED_SECRET_VALUE_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|secret|token|password|credential)\w*"
+    r"\s*[:=]\s*[\"']([A-Za-z0-9_\-]{16,})[\"']"
+)
+
 
 def sanitize(text) -> str:
     """Redact anything that looks like an API key/token/secret/password."""
@@ -78,6 +93,33 @@ def sanitize(text) -> str:
     text = _GITHUB_TOKEN_RE.sub("[REDACTED]", text)
     text = _TAVILY_KEY_RE.sub("[REDACTED]", text)
     return text
+
+
+def contains_probable_secret(text) -> bool:
+    """True if `text` contains something that looks like an actual hardcoded
+    secret VALUE: a known API key/token format (Google/GitHub/Tavily), or a
+    KEY/SECRET/TOKEN/PASSWORD/CREDENTIAL assignment whose value is itself a
+    quoted, sufficiently long literal.
+
+    Used as a content-level defense-in-depth check (e.g. tools.py's project
+    ZIP packaging scans real file contents before archiving them) so a
+    secret accidentally left in a non-obviously-named file isn't missed by a
+    filename-only exclusion list. Deliberately does NOT reuse sanitize()'s
+    looser _KEY_VALUE_RE here - that pattern matches on the variable name
+    alone (right for redacting already-suspicious tool output/pasted text),
+    which would misfire on completely ordinary source code that merely
+    assigns a variable named api_key/token/secret to a non-literal
+    expression (e.g. `api_key = os.getenv("GOOGLE_API_KEY")`,
+    `token = get_token()`) - exactly the kind of code this project's own
+    files legitimately contain. Never itself reveals the matched value -
+    callers only ever get True/False back."""
+    text = str(text)
+    return bool(
+        _GOOGLE_KEY_RE.search(text)
+        or _GITHUB_TOKEN_RE.search(text)
+        or _TAVILY_KEY_RE.search(text)
+        or _HARDCODED_SECRET_VALUE_RE.search(text)
+    )
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -90,11 +132,13 @@ def _truncate(text: str, limit: int) -> str:
 def _safe_print(text: str) -> None:
     """Print text that may contain characters the terminal's codepage can't
     encode (e.g. Windows' default cp1252 console hitting non-Latin/emoji
-    characters pulled from web_search/documentation_search results).
+    characters pulled from web_search/documentation_search results, or from
+    Gemini's own answer text, which routinely includes emoji).
 
-    Without this, an otherwise-successful tool call could crash the whole
-    request with a UnicodeEncodeError purely because of what a web page
-    happened to contain - printing must never be why a request fails.
+    Without this, an otherwise-successful tool call (or, via safe_print()
+    below, a successful chat turn) could crash the whole request with a
+    UnicodeEncodeError purely because of what the text happened to contain -
+    printing must never be why a request fails.
     """
     try:
         print(text)
@@ -103,6 +147,16 @@ def _safe_print(text: str) -> None:
         print(
             text.encode(encoding, errors="replace").decode(encoding, errors="replace")
         )
+
+
+def safe_print(text: str) -> None:
+    """Public entry point to _safe_print() for callers outside this module
+    (e.g. cli.py's "Assistant: ..." lines) that print model-generated text
+    directly to the console and need the same protection - see _safe_print's
+    docstring. Confirmed live: a real Gemini answer containing a folder emoji
+    crashes a bare print() with UnicodeEncodeError on a legacy Windows
+    console codepage (cp1252)."""
+    _safe_print(text)
 
 
 def _section(label: str, body: str) -> None:
@@ -200,3 +254,63 @@ def log_error(tool_name: str, error) -> None:
         "ERROR",
         f"Tool execution failed.\n\nTool Name : {tool_name}\nError     : {sanitize(error)}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Performance timing (debugging aid only)
+# ---------------------------------------------------------------------------
+# Deliberately NOT routed through _section()/_events - these lines are for a
+# developer watching the terminal to see where time is actually going
+# (classification, LLM calls, tool calls, test runs, ...), not for the
+# Streamlit "Agent Logs" panel, so they never clutter what an end user sees.
+
+
+def log_perf(label: str, seconds: float) -> None:
+    """Print a single lightweight "[PERF] <label>: <seconds>s" terminal line."""
+    _safe_print(f"[PERF] {label}: {seconds:.2f}s")
+
+
+# ---------------------------------------------------------------------------
+# LLM call instrumentation (quota/rate-limit observability)
+# ---------------------------------------------------------------------------
+# Unlike log_perf() above, this IS routed through _section() - so it also
+# lands in get_recent_events() for the Streamlit "Agent Logs" panel, not just
+# the terminal. That matters here specifically: distinguishing "one real
+# Gemini request" from "several silently retried requests" (and seeing which
+# ones failed with what category) is exactly the visibility needed to tell a
+# real Google quota problem apart from the app making excessive calls, and a
+# developer watching only the Streamlit UI (not raw stdout) needs to see it
+# too. Only ever safe, non-secret metadata - never the request/response
+# content, the API key, or any header.
+
+
+def log_llm_call(
+    *,
+    purpose: str,
+    model: str,
+    attempt: int,
+    duration: float,
+    status: str,
+    status_category: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Log one real Gemini request attempt: what it was for, which model,
+    which attempt number (for retries), how long it took, and whether it
+    succeeded. `status` is "success" or "failure"; `status_category` further
+    classifies a failure (e.g. "rate_limit", "quota_exhausted", "timeout",
+    "invalid_credential") for retry-handling and quota-vs-bug diagnosis.
+    `detail` is optional extra safe context (e.g. the specific Google quota
+    metric name a 429 named) - never raw exception text, which sanitize()
+    would be required for."""
+    lines = [
+        f"Purpose: {purpose}",
+        f"Model: {model}",
+        f"Attempt: {attempt}",
+        f"Duration: {duration:.2f}s",
+        f"Status: {status}",
+    ]
+    if status_category:
+        lines.append(f"Category: {status_category}")
+    if detail:
+        lines.append(f"Detail: {sanitize(detail)}")
+    _section("LLM", "\n".join(lines))

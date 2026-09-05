@@ -15,29 +15,42 @@ Type "exit", "quit", or press Ctrl+C to stop.
 
 import workflow
 from agent import (
+    api_key_looks_valid,
     build_agent,
+    describe_agent_error,
     get_api_key,
     new_ai_message,
     new_human_message,
     run_agent_turn,
 )
+from logger import safe_print
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
 
 
 def _print_pending_change(change: workflow.ProposedChange) -> None:
     """Show one proposed change's full detail - the CLI's equivalent of the
-    Streamlit sidebar's expandable "Pending Approvals" card."""
-    print(f"\n{'=' * 60}")
-    print("APPROVAL REQUIRED")
-    print(f"{'=' * 60}")
-    print(f"File   : {change.file_path}")
-    print(f"Action : {change.action}")
-    print(f"Risk   : {change.risk}")
-    print(f"Reason : {change.reason}")
-    print(f"{'-' * 60}")
-    print(change.content)
-    print(f"{'=' * 60}")
+    Streamlit sidebar's expandable "Pending Approvals" card.
+
+    Uses safe_print (not a bare print()) for every field that can hold
+    AI-generated free text (`reason`, and especially `content` - a whole
+    proposed file's text, which regularly contains emoji, e.g. a Streamlit
+    app's own UI copy). Confirmed live: a bare print() of generated file
+    content crashed the entire CLI session with UnicodeEncodeError on a
+    legacy Windows console codepage (cp1252) - the exact same class of bug
+    already fixed for the "Assistant: ..." answer line (see
+    test_run_turn_does_not_crash_on_a_legacy_console_codepage), just missed
+    here."""
+    safe_print(f"\n{'=' * 60}")
+    safe_print("APPROVAL REQUIRED")
+    safe_print(f"{'=' * 60}")
+    safe_print(f"File   : {change.file_path}")
+    safe_print(f"Action : {change.action}")
+    safe_print(f"Risk   : {change.risk}")
+    safe_print(f"Reason : {change.reason}")
+    safe_print(f"{'-' * 60}")
+    safe_print(change.content)
+    safe_print(f"{'=' * 60}")
 
 
 def _handle_pending_approvals(change_ids: list[str]) -> list[str]:
@@ -87,15 +100,13 @@ def _run_turn(agent, conversation: list) -> str:
         from logger import log_error
 
         log_error("run_agent_turn", exc)
-        answer = (
-            "I couldn't process that request. Please check your API key or try again."
-        )
+        answer = describe_agent_error(exc)
         conversation.append(new_ai_message(answer))
-        print(f"\nAssistant: {answer}\n")
+        safe_print(f"\nAssistant: {answer}\n")
         return answer
 
     conversation.append(new_ai_message(answer))
-    print(f"\nAssistant: {answer}\n")
+    safe_print(f"\nAssistant: {answer}\n")
 
     pending_change_ids = result.get("pending_change_ids") or []
     for _ in range(_MAX_APPROVAL_ROUNDS):
@@ -121,13 +132,13 @@ def _run_turn(agent, conversation: list) -> str:
             from logger import log_error
 
             log_error("run_agent_turn", exc)
-            answer = "I couldn't process that request. Please check your API key or try again."
+            answer = describe_agent_error(exc)
             conversation.append(new_ai_message(answer))
-            print(f"\nAssistant: {answer}\n")
+            safe_print(f"\nAssistant: {answer}\n")
             return answer
 
         conversation.append(new_ai_message(answer))
-        print(f"\nAssistant: {answer}\n")
+        safe_print(f"\nAssistant: {answer}\n")
         pending_change_ids = result.get("pending_change_ids") or []
 
     return answer
@@ -135,12 +146,18 @@ def _run_turn(agent, conversation: list) -> str:
 
 def main() -> None:
     api_key = get_api_key()
-    if not api_key or api_key == "your_google_api_key_here":
+    if not api_key or not api_key.strip() or api_key == "your_google_api_key_here":
         print(
             "GOOGLE_API_KEY is not configured. Please add it to your .env file "
             "(see .env.example) and try again."
         )
         return
+    if not api_key_looks_valid(api_key):
+        print(
+            "Note: GOOGLE_API_KEY doesn't match the traditional 'AIza...' "
+            "Gemini key format, but continuing - Google's API will "
+            "determine whether it's actually valid.\n"
+        )
 
     try:
         agent = build_agent()

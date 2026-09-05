@@ -10,21 +10,38 @@ which is raised before any network call is made.
 import base64
 
 import pytest
+from langchain_core.exceptions import (
+    ModelAPIError,
+    ModelAuthenticationError,
+    ModelConnectionError,
+    ModelInvalidRequestError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+    ModelTimeoutError,
+)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import agent as agent_module
 from agent import (
     MAX_AUTO_CONTINUE_STEPS,
+    MAX_LLM_RETRY_ATTEMPTS,
     SCOPE_REFUSAL_MESSAGE,
     SYSTEM_PROMPT,
     TOOLS,
+    _classify_llm_exception,
     _derive_workflow_states,
     _extract_text,
+    _invoke_with_retry,
     _pytest_call_passed,
+    _quota_violation_summary,
+    _retry_delay_seconds,
+    api_key_looks_valid,
     ask_agent,
     build_agent,
     classify_request,
     create_plan,
+    describe_agent_error,
     get_api_key,
     new_ai_message,
     new_human_message,
@@ -44,14 +61,391 @@ class _FakeAgent:
 
 
 def test_get_api_key_reads_env(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
-    assert get_api_key() == "test-key-123"
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
+    assert get_api_key() == "AIzaSyD-fake1234567890abcdefghijklmno"
+
+
+def test_get_api_key_reads_google_api_key_specifically_not_a_different_name(
+    monkeypatch,
+):
+    """Regression coverage for the reported config confusion: only
+    GOOGLE_API_KEY is ever read - a differently-named variable (e.g. a
+    GEMINI_API_KEY someone might set by habit from other tools) must never
+    be picked up instead or as a fallback."""
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
+    assert get_api_key() is None
 
 
 def test_build_agent_requires_api_key(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     with pytest.raises(ValueError):
         build_agent()
+
+
+def test_build_agent_rejects_empty_api_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+    with pytest.raises(ValueError, match="not configured"):
+        build_agent()
+
+
+def test_build_agent_rejects_whitespace_only_api_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "   ")
+    with pytest.raises(ValueError):
+        build_agent()
+
+
+def test_build_agent_rejects_placeholder_api_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "your_google_api_key_here")
+    with pytest.raises(ValueError, match="not configured"):
+        build_agent()
+
+
+# ---------------------------------------------------------------------------
+# API key FORMAT validation (api_key_looks_valid / _build_llm) - most Gemini
+# keys from Google AI Studio start with "AIza", but this is advisory only:
+# a real support case showed a working Google credential shaped "AQ.<...>"
+# (a format api_key_looks_valid() doesn't recognize) that Google's own API
+# accepted successfully. So a differently-shaped key must never be
+# hard-rejected locally - only a real ModelAuthenticationError from Google
+# is treated as proof a key is invalid (see describe_agent_error below).
+# ---------------------------------------------------------------------------
+
+_FAKE_VALID_KEY = "AIzaSyD-fake1234567890abcdefghijklmno"
+_FAKE_INVALID_FORMAT_KEY = "AQ.FakeNonGeminiTokenForTestingOnly1234567890"
+
+
+def test_api_key_looks_valid_accepts_real_shaped_key():
+    assert api_key_looks_valid(_FAKE_VALID_KEY) is True
+
+
+def test_api_key_looks_valid_rejects_non_gemini_shaped_key():
+    assert api_key_looks_valid(_FAKE_INVALID_FORMAT_KEY) is False
+
+
+def test_api_key_looks_valid_rejects_empty_and_none():
+    assert api_key_looks_valid("") is False
+    assert api_key_looks_valid(None) is False
+
+
+def test_build_agent_does_not_reject_a_differently_shaped_key(monkeypatch):
+    """A key that doesn't match the traditional 'AIza...' shape must still
+    reach ChatGoogleGenerativeAI construction (mocked here, as in
+    test_build_llm_uses_low_thinking_level_for_latency) - only Google's own
+    API gets to decide whether a configured credential is invalid."""
+    monkeypatch.setenv("GOOGLE_API_KEY", _FAKE_INVALID_FORMAT_KEY)
+    monkeypatch.setattr(agent_module, "ChatGoogleGenerativeAI", lambda **kw: object())
+    build_agent()  # must not raise
+
+
+def test_build_agent_succeeds_past_validation_with_a_valid_looking_key(monkeypatch):
+    """A format-valid key must also reach ChatGoogleGenerativeAI
+    construction (mocked here, as in
+    test_build_llm_uses_low_thinking_level_for_latency)."""
+    monkeypatch.setenv("GOOGLE_API_KEY", _FAKE_VALID_KEY)
+    monkeypatch.setattr(agent_module, "ChatGoogleGenerativeAI", lambda **kw: object())
+    build_agent()  # must not raise
+
+
+def test_missing_key_error_never_contains_a_key_value(monkeypatch):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(ValueError) as exc_info:
+        build_agent()
+    assert "AIza" not in str(exc_info.value)  # no key value, real or fake, is echoed
+
+
+def test_describe_agent_error_messages_never_contain_a_key_value(monkeypatch):
+    """describe_agent_error() only ever names GOOGLE_API_KEY, never a value -
+    exercised across every branch of its Model*Error handling."""
+    exceptions = [
+        ModelAuthenticationError(_FAKE_VALID_KEY),
+        ModelPermissionDeniedError(_FAKE_VALID_KEY),
+        ModelRateLimitError(_FAKE_VALID_KEY),
+        ModelNotFoundError(_FAKE_VALID_KEY),
+        ModelInvalidRequestError(_FAKE_VALID_KEY),
+        ModelAPIError(_FAKE_VALID_KEY),
+        ModelTimeoutError(_FAKE_VALID_KEY),
+        ModelConnectionError(_FAKE_VALID_KEY),
+    ]
+    for exc in exceptions:
+        message = describe_agent_error(exc)
+        assert _FAKE_VALID_KEY not in message, f"leaked in: {type(exc).__name__}"
+
+
+# ---------------------------------------------------------------------------
+# 429/quota error classification and bounded retry (_classify_llm_exception,
+# _invoke_with_retry, _retry_delay_seconds, _quota_violation_summary) - a
+# real Gemini 429 must be reported as a quota/rate-limit problem, never as
+# "invalid API key" (already covered above), AND a short-window rate limit
+# must be distinguished from a longer-window (e.g. daily) quota that's
+# genuinely exhausted, since only the former is worth a brief retry.
+# ---------------------------------------------------------------------------
+
+
+class _FakeGoogleClientError(Exception):
+    """Stands in for the real google.genai.errors.ClientError: carries the
+    same structured `.details` dict a real 429/quota response has (see
+    google/genai/errors.py's APIError), which langchain_google_genai's
+    Model*Error subclasses chain via `raise ... from e` (so it's reachable
+    through `__cause__`, exactly like a real Gemini error)."""
+
+    def __init__(self, details):
+        super().__init__(str(details))
+        self.details = details
+
+
+def _make_rate_limit_error(
+    quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+    retry_delay="3s",
+):
+    details = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Quota exceeded",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaId": quota_id,
+                            "quotaMetric": "generativelanguage.googleapis.com/x",
+                        }
+                    ],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": retry_delay,
+                },
+            ],
+        }
+    }
+    cause = _FakeGoogleClientError(details)
+    exc = ModelRateLimitError(f"Error calling model 'x' (RESOURCE_EXHAUSTED): {cause}")
+    exc.__cause__ = cause
+    return exc
+
+
+def test_classify_llm_exception_rate_limit_vs_quota_exhausted():
+    """A per-minute 429 is "rate_limit" (worth a brief retry); a per-day 429
+    is "quota_exhausted" (retrying within seconds cannot help)."""
+    per_minute = _make_rate_limit_error(
+        quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    )
+    assert _classify_llm_exception(per_minute) == "rate_limit"
+
+    per_day = _make_rate_limit_error(
+        quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+    assert _classify_llm_exception(per_day) == "quota_exhausted"
+
+
+def test_classify_llm_exception_covers_every_category():
+    assert (
+        _classify_llm_exception(ModelAuthenticationError("x")) == "invalid_credential"
+    )
+    assert (
+        _classify_llm_exception(ModelPermissionDeniedError("x")) == "invalid_credential"
+    )
+    assert _classify_llm_exception(ModelInvalidRequestError("x")) == "invalid_request"
+    assert _classify_llm_exception(ModelNotFoundError("x")) == "not_found"
+    assert _classify_llm_exception(ModelAPIError("x")) == "server_error"
+    assert _classify_llm_exception(ModelTimeoutError("x")) == "timeout"
+    assert _classify_llm_exception(ModelConnectionError("x")) == "connection"
+    assert _classify_llm_exception(TimeoutError("The request timed out")) == "timeout"
+    assert (
+        _classify_llm_exception(ConnectionError("connection refused")) == "connection"
+    )
+    assert _classify_llm_exception(RuntimeError("boom")) == "other"
+
+
+def test_retry_delay_seconds_reads_the_servers_own_retry_info():
+    exc = _make_rate_limit_error(retry_delay="7s")
+    assert _retry_delay_seconds(exc) == 7.0
+
+
+def test_retry_delay_seconds_is_none_without_retry_info():
+    assert _retry_delay_seconds(ModelRateLimitError("plain, no cause")) is None
+
+
+def test_quota_violation_summary_reads_the_quota_id():
+    exc = _make_rate_limit_error(
+        quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+    assert (
+        _quota_violation_summary(exc)
+        == "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+
+
+def test_invoke_with_retry_succeeds_first_try_logs_one_attempt(monkeypatch):
+    logged = []
+    monkeypatch.setattr(agent_module, "log_llm_call", lambda **kw: logged.append(kw))
+
+    result = _invoke_with_retry(lambda: "ok", purpose="test")
+
+    assert result == "ok"
+    assert len(logged) == 1
+    assert logged[0]["status"] == "success"
+    assert logged[0]["attempt"] == 1
+
+
+def test_invoke_with_retry_retries_rate_limit_then_succeeds(monkeypatch):
+    logged = []
+    slept = []
+    monkeypatch.setattr(agent_module, "log_llm_call", lambda **kw: logged.append(kw))
+    monkeypatch.setattr(agent_module.time, "sleep", lambda s: slept.append(s))
+
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise _make_rate_limit_error(retry_delay="4s")
+        return "ok"
+
+    result = _invoke_with_retry(flaky, purpose="test")
+
+    assert result == "ok"
+    assert attempts["n"] == 2
+    assert len(logged) == 2
+    assert logged[0]["status"] == "failure"
+    assert logged[0]["status_category"] == "rate_limit"
+    assert logged[1]["status"] == "success"
+    assert slept == [4.0]  # respected the server's own retry-after hint, not a guess
+
+
+def test_invoke_with_retry_is_bounded_and_gives_up(monkeypatch):
+    """Never retries indefinitely - stops at MAX_LLM_RETRY_ATTEMPTS and
+    raises the final exception."""
+    calls = {"n": 0}
+    monkeypatch.setattr(agent_module, "log_llm_call", lambda **kw: None)
+    monkeypatch.setattr(agent_module.time, "sleep", lambda _s: None)
+
+    def always_fails():
+        calls["n"] += 1
+        raise _make_rate_limit_error(retry_delay="1s")
+
+    with pytest.raises(ModelRateLimitError):
+        _invoke_with_retry(always_fails, purpose="test")
+
+    assert calls["n"] == MAX_LLM_RETRY_ATTEMPTS
+
+
+def test_invoke_with_retry_never_retries_a_daily_quota_exhaustion(monkeypatch):
+    """Retrying a longer-window quota that's already exhausted cannot
+    succeed within seconds - must not retry or sleep at all."""
+    calls = {"n": 0}
+    monkeypatch.setattr(agent_module, "log_llm_call", lambda **kw: None)
+    monkeypatch.setattr(
+        agent_module.time,
+        "sleep",
+        lambda _s: (_ for _ in ()).throw(
+            AssertionError("must not sleep/retry a daily quota")
+        ),
+    )
+
+    def daily_quota_exhausted():
+        calls["n"] += 1
+        raise _make_rate_limit_error(
+            quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+        )
+
+    with pytest.raises(ModelRateLimitError):
+        _invoke_with_retry(daily_quota_exhausted, purpose="test")
+
+    assert calls["n"] == 1
+
+
+def test_invoke_with_retry_never_retries_an_invalid_credential(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(agent_module, "log_llm_call", lambda **kw: None)
+    monkeypatch.setattr(
+        agent_module.time,
+        "sleep",
+        lambda _s: (_ for _ in ()).throw(
+            AssertionError("must not retry a bad credential")
+        ),
+    )
+
+    def bad_credential():
+        calls["n"] += 1
+        raise ModelAuthenticationError("nope")
+
+    with pytest.raises(ModelAuthenticationError):
+        _invoke_with_retry(bad_credential, purpose="test")
+
+    assert calls["n"] == 1
+
+
+def test_describe_agent_error_distinguishes_rate_limit_from_quota_exhausted():
+    per_minute_msg = describe_agent_error(
+        _make_rate_limit_error(
+            quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+        )
+    )
+    assert "wait a moment" in per_minute_msg.lower()
+    assert "daily" not in per_minute_msg.lower()
+
+    per_day_msg = describe_agent_error(
+        _make_rate_limit_error(
+            quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+        )
+    )
+    assert "daily" in per_day_msg.lower()
+    # The specific quota metric is surfaced, not just a generic message.
+    assert "GenerateRequestsPerDayPerProjectPerModel-FreeTier" in per_day_msg
+
+
+def test_describe_agent_error_distinguishes_timeout_and_connection_from_auth():
+    timeout_msg = describe_agent_error(ModelTimeoutError("The request timed out"))
+    assert "api key" not in timeout_msg.lower()
+    assert "timed out" in timeout_msg.lower() or "timeout" in timeout_msg.lower()
+
+    connection_msg = describe_agent_error(ModelConnectionError("connection refused"))
+    assert "api key" not in connection_msg.lower()
+    assert "connection" in connection_msg.lower()
+
+
+def test_build_llm_uses_low_thinking_level_for_latency(monkeypatch):
+    """Every call built via _build_llm() (classification, planning,
+    transcription, and the tool-using agent's own turns) is either a
+    mechanical single-word/short-list output or a tool-selection step guided
+    by a detailed system prompt - none need deep reasoning depth. Measured
+    directly against the live Gemini API, the default thinking level turned
+    a trivial one-word classification into tens of seconds of hidden
+    reasoning; "low" is Google's own documented setting for minimizing
+    latency without disabling the model's ability to reason when it must."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
+    captured = {}
+
+    def _fake_ctor(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(agent_module, "ChatGoogleGenerativeAI", _fake_ctor)
+    agent_module._build_llm(temperature=0.0)
+
+    assert captured.get("thinking_level") == "low"
+
+
+def test_build_llm_disables_the_sdks_own_hidden_retries(monkeypatch):
+    """ChatGoogleGenerativeAI defaults to up to 6 silent, blind retries per
+    request (its own fixed backoff, ignoring Google's retry-after hint, with
+    no visibility into individual attempts) - _build_llm() must override
+    this to max_retries=1 so _invoke_with_retry() is the only layer that
+    ever retries a Gemini call, with full visibility into every attempt."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
+    captured = {}
+
+    def _fake_ctor(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(agent_module, "ChatGoogleGenerativeAI", _fake_ctor)
+    agent_module._build_llm(temperature=0.0)
+
+    assert captured.get("max_retries") == 1
 
 
 def test_new_human_message():
@@ -197,6 +591,19 @@ def test_system_prompt_covers_regression_testing():
     assert "regression" in SYSTEM_PROMPT.lower()
 
 
+def test_system_prompt_requires_reporting_real_tool_findings_specifically():
+    """Regression test for a real transparency gap found in live testing:
+    the HRMS generation's final summary said only "Run Ruff and Black
+    checks" despite Ruff actually finding 13 real issues - technically not
+    a fabrication (Ruff really was run), but it hid that anything was
+    found. The Report step must require stating each check's actual
+    outcome (found issues vs none) rather than a vague "completed"/"run"."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "issues found" in prompt_lower
+    assert "vague" in prompt_lower
+    assert "reported as if it passed" in prompt_lower
+
+
 def test_system_prompt_rejects_arbitrary_command_execution():
     prompt_lower = SYSTEM_PROMPT.lower()
     assert "powershell" in prompt_lower
@@ -221,7 +628,7 @@ class _FakeTranscriptionLLM:
 
 
 def test_transcribe_audio_returns_transcribed_text(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakeTranscriptionLLM()
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -233,7 +640,7 @@ def test_transcribe_audio_returns_transcribed_text(monkeypatch):
 
 
 def test_transcribe_audio_sends_audio_as_base64_media_block(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakeTranscriptionLLM()
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -259,7 +666,7 @@ def test_transcribe_audio_requires_api_key(monkeypatch):
 def test_transcribe_audio_does_not_build_the_full_tool_using_agent(monkeypatch):
     # Voice input must only ever produce text - it must never spin up a
     # second, separate AI agent of its own.
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakeTranscriptionLLM()
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -408,7 +815,7 @@ class _FakePlannerLLM:
 
 
 def test_create_plan_parses_numbered_steps(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM(
         "1. Inspect project structure\n"
         "2. Find related files\n"
@@ -430,7 +837,7 @@ def test_create_plan_parses_numbered_steps(monkeypatch):
 
 
 def test_create_plan_strips_bullet_and_dash_markers(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("- Inspect project\n* Propose change\n")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -442,7 +849,7 @@ def test_create_plan_strips_bullet_and_dash_markers(monkeypatch):
 
 
 def test_create_plan_ignores_blank_lines(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("1. Step one\n\n\n2. Step two\n")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -462,7 +869,7 @@ def test_create_plan_requires_api_key(monkeypatch):
 def test_create_plan_does_not_build_the_full_tool_using_agent(monkeypatch):
     # The planner previews a plan for the user - it must not itself spin up
     # a second, separate tool-using agent.
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("1. Inspect project\n")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -510,8 +917,76 @@ def test_system_prompt_has_request_classification_section():
     prompt_lower = SYSTEM_PROMPT.lower()
     assert "calculation:" in prompt_lower
     assert "development:" in prompt_lower
+
+
+def test_create_project_zip_tool_is_registered():
+    tool_names = {t.name for t in TOOLS}
+    assert "create_project_zip" in tool_names
+
+
+def test_system_prompt_mentions_create_project_zip():
+    assert "create_project_zip" in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# New Application Generation: a whole new project from a requirement/SRS,
+# distinct from a DEVELOPMENT request that edits this assistant's own files.
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_has_new_application_generation_section():
+    assert "## New Application Generation" in SYSTEM_PROMPT
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "new application:" in prompt_lower
+
+
+def test_system_prompt_targets_generated_projects_folder():
+    assert "generated_projects/" in SYSTEM_PROMPT
+
+
+def test_system_prompt_forbids_touching_assistants_own_files_for_new_apps():
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "this assistant's own files" in prompt_lower
+    assert "never" in prompt_lower
+
+
+def test_system_prompt_instructs_target_argument_for_generated_project_tests():
+    assert 'run_pytest(target="generated_projects/' in SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_conftest_for_generated_projects():
+    """Regression coverage for a real failure found in manual end-to-end
+    verification: a generated project's own tests/ cannot import its
+    sibling source modules (ModuleNotFoundError) without an empty
+    conftest.py at the generated project's own root - the exact same reason
+    this assistant's own conftest.py exists. The system prompt must instruct
+    the model to always propose one, not leave it to chance."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "generated_projects/<slug>/conftest.py" in prompt_lower
+    assert "modulenotfounderror" in prompt_lower
+
+
+def test_system_prompt_covers_request_classification_testing_and_verification():
+    prompt_lower = SYSTEM_PROMPT.lower()
     assert "development + testing" in prompt_lower
     assert "development + testing + verification" in prompt_lower
+
+
+def test_launch_generated_app_tool_is_registered():
+    tool_names = {t.name for t in TOOLS}
+    assert {"launch_generated_app", "stop_generated_app"} <= tool_names
+
+
+def test_system_prompt_covers_live_preview_launch():
+    """The live-launch feature exists now - the system prompt must instruct
+    the model to only call launch_generated_app after real completion, to
+    report exactly what the tool returned (never a fabricated URL/status),
+    and that stop_generated_app never affects this assistant's own process."""
+    prompt_lower = SYSTEM_PROMPT.lower()
+    assert "launch_generated_app" in prompt_lower
+    assert "stop_generated_app" in prompt_lower
+    assert "never affects this assistant's own process" in prompt_lower
+    assert "localhost health check" in prompt_lower
 
 
 def test_system_prompt_classification_warns_against_keyword_matching():
@@ -586,7 +1061,7 @@ def test_system_prompt_describes_repair_limit_as_real_not_a_guideline():
 
 
 def test_classify_request_true_for_development_response(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("DEVELOPMENT")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -598,7 +1073,7 @@ def test_classify_request_true_for_development_response(monkeypatch):
 
 
 def test_classify_request_false_for_other_response(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("OTHER")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -616,7 +1091,7 @@ def test_classify_request_requires_api_key(monkeypatch):
 def test_classify_request_does_not_build_the_full_tool_using_agent(monkeypatch):
     # classify_request is a single plain completion call (like create_plan) -
     # it must never itself spin up a second, separate tool-using agent.
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key-123")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     fake_llm = _FakePlannerLLM("DEVELOPMENT")
     monkeypatch.setattr(
         agent_module, "ChatGoogleGenerativeAI", lambda **kwargs: fake_llm
@@ -668,6 +1143,44 @@ def test_run_agent_turn_passes_non_development_requests_straight_through(
 
     assert len(calls) == 1
     assert result["answer"] == "4"
+
+
+def test_run_agent_turn_simple_conceptual_question_makes_one_call_no_nudge(
+    monkeypatch,
+):
+    """Performance regression guard: a simple conceptual question (no tools
+    needed, not a development task) must resolve in exactly one ask_agent
+    call, with no auto-continuation nudge ever appended to the conversation
+    and no workflow states recorded - the Phase 6 development loop's extra
+    LLM round trips must never fire for a plain question."""
+    calls = []
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(list(conversation))
+        return {
+            "answer": "subprocess lets Python launch and manage other programs.",
+            "tool_calls": [],
+            "workflow_states": [],
+            "pending_change_ids": [],
+        }
+
+    classify_calls = []
+
+    def fake_classify(task):
+        classify_calls.append(task)
+        return False
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", fake_classify)
+
+    conversation = [new_human_message("Explain subprocess in Python")]
+    result = run_agent_turn(object(), conversation)
+
+    assert len(classify_calls) == 1  # classified once, never re-checked
+    assert len(calls) == 1  # exactly one LLM turn - no auto-continue loop
+    assert calls[0] == conversation  # sent through unmodified, no nudge appended
+    assert result["workflow_states"] == []
+    assert result["tool_calls"] == []
 
 
 def test_run_agent_turn_stops_once_a_change_is_proposed(monkeypatch):
@@ -763,12 +1276,13 @@ def test_run_agent_turn_never_exceeds_max_auto_continue_steps(monkeypatch):
 
     def fake_ask_agent(agent, conversation):
         calls.append(conversation)
-        # Always makes "progress" (a tool call) but never actually finishes,
+        # Always makes real progress (a propose_file_change call each step,
+        # not just a read-only inspection tool) but never actually finishes,
         # so only the hard step cap can end the loop.
         return {
             "answer": "Still working on it.",
-            "tool_calls": [_tool_call("list_project_files")],
-            "workflow_states": ["INSPECTING"],
+            "tool_calls": [_tool_call("propose_file_change")],
+            "workflow_states": ["PROPOSING_CHANGE"],
             "pending_change_ids": [],
         }
 
@@ -779,6 +1293,40 @@ def test_run_agent_turn_never_exceeds_max_auto_continue_steps(monkeypatch):
     run_agent_turn(object(), conversation)
 
     assert len(calls) == MAX_AUTO_CONTINUE_STEPS
+
+
+def test_run_agent_turn_treats_read_only_tool_calls_as_idle(monkeypatch):
+    """Regression test for a real bug found in live testing: a request the
+    model can't make real progress on (e.g. told not to modify project
+    files) kept calling harmless read-only inspection tools (list_project_
+    files, git_status, list_pending_changes) between nudges instead of
+    stopping - each call reset a naive "was any tool called" idle counter,
+    so the loop burned every one of MAX_AUTO_CONTINUE_STEPS attempts for a
+    task that had nothing left to do. Calling only read-only tools (never
+    one of _PROGRESS_TOOL_NAMES) must still count as idle and bail out
+    after 2 consecutive such steps, exactly like calling no tool at all."""
+    calls = []
+    read_only_tools = ["list_project_files", "git_status", "list_pending_changes"]
+
+    def fake_ask_agent(agent, conversation):
+        calls.append(conversation)
+        return {
+            "answer": "Nothing left to do - no files were modified as requested.",
+            "tool_calls": [_tool_call(read_only_tools[(len(calls) - 1) % 3])],
+            "workflow_states": ["INSPECTING"],
+            "pending_change_ids": [],
+        }
+
+    monkeypatch.setattr(agent_module, "ask_agent", fake_ask_agent)
+    monkeypatch.setattr(agent_module, "classify_request", lambda task: True)
+
+    conversation = [
+        new_human_message("Create a function. Do not modify project files.")
+    ]
+    run_agent_turn(object(), conversation)
+
+    assert len(calls) == 2  # one real attempt + one nudge, then it bails out
+    assert len(calls) < MAX_AUTO_CONTINUE_STEPS
 
 
 def test_run_agent_turn_stops_when_the_model_asks_a_clarifying_question(monkeypatch):

@@ -89,8 +89,8 @@ def _safe_display_name(filename: str) -> str:
 def format_size(size_bytes: int) -> str:
     """Format a byte count as a short human-readable string (e.g. "4.2 KB")."""
     size = float(size_bytes)
-    for unit in ("B", "KB", "MB"):
-        if size < 1024 or unit == "MB":
+    for unit in ("B", "KB"):
+        if size < 1024:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} MB"

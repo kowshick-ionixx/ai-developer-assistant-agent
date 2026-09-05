@@ -141,6 +141,69 @@ def test_run_pytest_reports_missing_tests_folder(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# run_pytest(target=...) - testing a generated sub-project's own tests/,
+# without disturbing the default (no-argument) behavior above at all.
+# ---------------------------------------------------------------------------
+
+
+def test_run_pytest_with_target_runs_that_folder_instead(monkeypatch):
+    captured_args = {}
+
+    def fake_run(args, **kwargs):
+        captured_args["args"] = args
+        return _FakeCompletedProcess(stdout="2 passed in 0.05s\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    scratch_dir = PROJECT_ROOT / "generated_projects" / "_scratch_hrms" / "tests"
+    scratch_dir.mkdir(parents=True)
+    try:
+        result = run_pytest.invoke({"target": "generated_projects/_scratch_hrms/tests"})
+        assert "Exit code: 0" in result
+        assert "2 passed" in result
+        assert "generated_projects/_scratch_hrms/tests" in captured_args["args"]
+    finally:
+        import shutil
+
+        shutil.rmtree(PROJECT_ROOT / "generated_projects" / "_scratch_hrms")
+
+
+def test_run_pytest_with_target_rejects_path_traversal():
+    result = run_pytest.invoke({"target": "../outside"})
+    assert "outside the project directory" in result
+
+
+def test_run_pytest_with_target_rejects_excluded_folder():
+    result = run_pytest.invoke({"target": "venv"})
+    assert "security reasons" in result.lower()
+
+
+def test_run_pytest_with_target_reports_missing_folder():
+    result = run_pytest.invoke({"target": "generated_projects/does_not_exist/tests"})
+    assert "no 'generated_projects/does_not_exist/tests' folder" in result.lower()
+
+
+def test_run_pytest_with_target_does_not_touch_repair_attempts(monkeypatch):
+    """The repair-attempt circuit breaker (workflow.py) tracks THIS
+    project's own files - a generated sub-project's test run is an
+    independent surface and must never clear (or fail to clear) it."""
+    workflow.record_apply("some_file.py")
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess(stdout="1 passed\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    scratch_dir = PROJECT_ROOT / "generated_projects" / "_scratch_hrms2" / "tests"
+    scratch_dir.mkdir(parents=True)
+    try:
+        run_pytest.invoke({"target": "generated_projects/_scratch_hrms2/tests"})
+        assert workflow.repair_attempts_for("some_file.py") == 1
+    finally:
+        import shutil
+
+        shutil.rmtree(PROJECT_ROOT / "generated_projects" / "_scratch_hrms2")
+
+
+# ---------------------------------------------------------------------------
 # check_python_syntax - real parsing, no subprocess involved
 # ---------------------------------------------------------------------------
 

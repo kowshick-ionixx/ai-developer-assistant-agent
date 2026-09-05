@@ -6,10 +6,10 @@ when it decides it needs help with something the language model can't (or
 shouldn't) do on its own, like exact arithmetic or running an external
 command-line program.
 
-This file defines twenty-one tools:
+This file defines twenty-four tools:
     1. calculator             -> evaluates a math expression safely
     2. explain_python_code    -> analyzes Python code structure (never runs it)
-    3. run_pytest              -> runs this project's own test suite
+    3. run_pytest              -> runs this project's own test suite, or a generated sub-project's
     4. run_ruff                -> lints Python code/files with Ruff
     5. run_black               -> checks/formats Python code/files with Black
     6. check_python_syntax    -> parses Python file(s) to find syntax errors (never runs them)
@@ -28,6 +28,9 @@ This file defines twenty-one tools:
     19. propose_file_change   -> (Phase 6) registers a pending file create/modify - never writes
     20. apply_approved_change -> (Phase 6) writes a change, but only once a human has approved it
     21. list_pending_changes  -> (Phase 6) lists proposed changes and their real change_id/approval state
+    22. create_project_zip    -> (Phase 6) packages this project's real current files into a ZIP
+    23. launch_generated_app  -> (Phase 6) starts a generated Streamlit app as its own local server
+    24. stop_generated_app    -> (Phase 6) stops a generated app's server started by tool 23
 
 Code generation, debugging, review, and refactoring are handled by Gemini's
 own reasoning (guided by the system prompt in agent.py) rather than by tools
@@ -74,7 +77,12 @@ to decide *when* to use the tool, so keep it clear and specific.
 Safety notes for run_pytest/run_ruff/run_black:
     - Every subprocess call uses an argument list (never shell=True), so
       there is no shell/command injection.
-    - run_pytest only ever runs this project's fixed "tests" folder.
+    - run_pytest runs this project's fixed "tests" folder by default; its
+      optional `target` (for testing a generated sub-project under
+      generated_projects/ - see propose_file_change's notes below) is
+      resolved and checked against the project root exactly like file_path
+      below, and is only ever passed to pytest as a plain path argument -
+      never a shell command.
     - Any file_path the user supplies is resolved and checked against the
       project root; anything that would escape it (e.g. "..", an absolute
       path elsewhere) is rejected before it touches the filesystem.
@@ -132,14 +140,97 @@ Safety notes for propose_file_change/apply_approved_change (Phase 6):
       proposed changes across turns, instead of relying on its own memory
       of an earlier turn (which can be unreliable) or inventing a
       change_id.
+
+Safety notes for create_project_zip (Phase 6 - final packaging step):
+    - Only ever reads real files already inside PROJECT_ROOT - it never
+      writes/modifies a project source file, and the archive it produces is
+      saved only under this project's own "dist/" folder (never elsewhere on
+      disk), using the same resolved-path/relative_to(PROJECT_ROOT) safety
+      check as every other file tool here.
+    - Reuses read_project_file/run_ruff's exact exclusion rules (noise
+      folders, .env, credential-like extensions/keywords) PLUS: the "dist/"
+      output folder itself, any ".zip" file (never re-packages a previously
+      generated archive), and any file whose real content matches
+      logger.contains_probable_secret() - a content-level check, not just a
+      filename check, so a secret left in an otherwise innocuous file is
+      still excluded rather than shipped.
+    - Idempotent: a module-level cache keyed on a cheap fingerprint (every
+      included file's relative path/size/modification time) means repeated
+      calls - a Streamlit rerun, or the agent being asked twice - reuse the
+      already-built archive instead of rescanning and re-zipping the whole
+      project, unless the real project files actually changed.
+    - Never a substitute for propose_file_change/apply_approved_change/
+      run_pytest/run_ruff/run_black - it only archives whatever the project's
+      files already are; it cannot create, approve, or apply a change, and
+      cannot make a failing test suite appear to pass.
+
+Safety notes for launch_generated_app/stop_generated_app (Phase 6 - live
+preview of a generated application):
+    - NOT a generic "run any command" tool. The only command ever
+      constructed is a fixed argv list -
+      [sys.executable, "-m", "streamlit", "run", <validated .py file>,
+      "--server.port", <port>, "--server.headless", "true"] - built from a
+      validated project folder/entry file, never a raw string from the
+      model or user, and never passed through a shell.
+    - Only ever launches something already resolved to be inside
+      "generated_projects/" under PROJECT_ROOT (the same resolved-path/
+      relative_to() check every other file tool here uses) - never this
+      assistant's own files, and never an arbitrary path elsewhere on disk.
+    - The entry file must actually exist, be a real ".py" file, and its
+      content must actually mention "streamlit" - a file that merely
+      happens to be named app.py/main.py but isn't a Streamlit script is
+      rejected rather than launched.
+    - Always launches on a port other than this assistant's own (8501) -
+      picks the first free port from a fixed candidate range, and never
+      lets a caller choose an arbitrary host/port.
+    - Never reports "running" from the process merely starting: after
+      launch, a real localhost HTTP request to the new process's own
+      health endpoint must actually succeed before status becomes
+      "running" - a process that starts but never becomes reachable (or
+      exits early) is reported as a failure, and is terminated rather than
+      left as an untracked orphan.
+    - Duplicate-launch safe: if a tracked server for the same project is
+      already running and healthy, launch_generated_app reuses it instead
+      of starting a second process on a second port.
+    - stop_generated_app identifies the process ONLY by the project_root
+      key of this module's own server registry (never a raw PID supplied
+      by a caller), so it can never be used to signal an unrelated
+      process, and never touches this assistant's own running process.
+    - Termination kills the WHOLE process tree (_terminate_process_tree:
+      `taskkill /F /T` on Windows, a process-group signal on POSIX), not
+      just the immediate child - confirmed necessary by direct testing:
+      Streamlit's own launcher spawns a further worker process, and a
+      plain terminate() on just the tracked PID left a real orphaned
+      server process still running after this tool reported "stopped".
+    - Log output is written to a file inside the generated project's own
+      folder (never printed with secrets); on failure, only a short,
+      sanitized tail of that log is included in the error message.
+    - Orphan-safe across an assistant restart: a small state file
+      (.server.state.json) is written next to the generated project
+      alongside its .server.log, so a server can still be reused/stopped/
+      reported as running even from a brand-new process that never itself
+      launched it (see _rehydrate_tracked_server). That file is only ever
+      a hint - it is re-verified with a REAL health check before ever
+      being trusted, and is removed the moment it's found to be stale.
 """
 
 import ast
+import hashlib
+import io
+import json
 import operator
 import os
 import re
+import signal
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 # GitPython checks for a working `git` executable at import time and raises
@@ -160,15 +251,18 @@ from langchain_core.tools import tool
 from tavily import TavilyClient
 
 from logger import (
+    contains_probable_secret,
     log_error,
     log_exit_code,
     log_tool_call,
     log_tool_execution,
     log_tool_input,
     log_tool_result,
+    sanitize,
 )
 from workflow import (
     get_change,
+    list_changeset,
     mark_applied,
     record_apply,
     record_test_outcome,
@@ -499,22 +593,48 @@ def _is_binary_file(path: Path) -> bool:
 
 
 @tool
-def run_pytest() -> str:
-    """Run this project's own pytest test suite (the tests/ folder) and report the results.
+def run_pytest(target: str = "") -> str:
+    """Run a pytest test suite and report the results.
 
     Use this whenever the user asks to run the tests, check whether the
-    tests pass, or verify the test suite. It always runs the project's
-    fixed test suite - it does not accept a path or any other argument, and
-    it never executes arbitrary code or shell commands.
+    tests pass, or verify a test suite. Pass NO argument (the default) to
+    run this project's own fixed "tests/" folder - unchanged from before.
+
+    Only pass `target` when testing a NEW application generated under
+    "generated_projects/" (see the New Application Generation section) -
+    e.g. target="generated_projects/hrms/tests" runs that generated
+    project's own tests instead of this assistant's own suite. `target`
+    must be a folder already inside this project's root (the same
+    path-safety rules as every other file tool here); it is never a shell
+    command and never executes arbitrary code.
     """
     log_tool_call("run_pytest")
-    log_tool_input("(no arguments - runs the project's fixed tests/ folder)")
+    target = (target or "").strip()
 
-    tests_dir = PROJECT_ROOT / "tests"
-    if not tests_dir.exists():
-        result = "Error: no tests/ folder was found in the project."
-        log_tool_result(result)
-        return result
+    if target:
+        log_tool_input(target)
+        safe_target = _resolve_safe_path(target)
+        if safe_target is None:
+            result = f"Error: '{target}' is outside the project directory and cannot be tested."
+            log_tool_result(result)
+            return result
+        if _is_excluded_path(safe_target):
+            result = f"Error: '{target}' cannot be tested for security reasons."
+            log_tool_result(result)
+            return result
+        if not safe_target.is_dir():
+            result = f"Error: no '{target}' folder was found in the project."
+            log_tool_result(result)
+            return result
+        pytest_arg = target
+    else:
+        log_tool_input("(no arguments - runs the project's fixed tests/ folder)")
+        tests_dir = PROJECT_ROOT / "tests"
+        if not tests_dir.exists():
+            result = "Error: no tests/ folder was found in the project."
+            log_tool_result(result)
+            return result
+        pytest_arg = "tests"
 
     log_tool_execution("Running pytest...")
     try:
@@ -527,7 +647,7 @@ def run_pytest() -> str:
         # characters) well before this function ever gets to return an
         # error string.
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "tests", "-v", "--no-header"],
+            [sys.executable, "-m", "pytest", pytest_arg, "-v", "--no-header"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -547,7 +667,12 @@ def run_pytest() -> str:
     output = (result.stdout + "\n" + result.stderr).strip()
     log_tool_result(output)
     log_exit_code(result.returncode)
-    record_test_outcome(result.returncode == 0)
+    # Only the assistant's own fixed suite feeds the repair-attempt circuit
+    # breaker (workflow.py's per-file tally) - a generated sub-project's own
+    # test run is a different, independent test surface and must never
+    # silently clear (or fail to clear) tallies for THIS project's files.
+    if not target:
+        record_test_outcome(result.returncode == 0)
     return f"Exit code: {result.returncode}\n\n{output}"
 
 
@@ -1014,10 +1139,19 @@ def search_project(query: str) -> str:
     matches: list[str] = []
     truncated = False
 
-    for path in sorted(PROJECT_ROOT.rglob("*")):
-        if not path.is_file():
-            continue
-        if _is_excluded_path(path) or _is_blocked_file(path):
+    # Prune noise directories (venv, .git, caches, ...) from the walk itself,
+    # the same way list_project_files' _build_tree does - rglob("*") followed
+    # by an _is_excluded_path() filter would still recurse into (and stat)
+    # every file under venv/ first, which on this project alone is ~20k
+    # filesystem entries that are then simply discarded on every single call.
+    candidate_paths: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIR_NAMES]
+        for filename in filenames:
+            candidate_paths.append(Path(dirpath) / filename)
+
+    for path in sorted(candidate_paths):
+        if _is_blocked_file(path):
             continue
         if path.suffix.lower() not in _SEARCHABLE_EXTENSIONS:
             continue
@@ -1776,6 +1910,51 @@ def propose_file_change(file_path: str, new_content: str, reason: str) -> str:
     return result
 
 
+def _write_approved_change_to_disk(change) -> str:
+    """Write ONE already-approved ProposedChange to disk - the shared,
+    single-file mechanism behind both apply_approved_change (the tool the
+    AI agent itself calls, one change_id at a time, per the Phase 6 system
+    prompt) and apply_approved_change_set (the deterministic, UI-triggered
+    operation that applies every approved member of a change set in one
+    guaranteed pass - see tools.py/app.py's change-set-level Apply button).
+
+    Callers are responsible for confirming change.approved is True first -
+    this performs no approval check of its own, only the path-safety and
+    repair-attempt-limit checks that must hold no matter which caller
+    writes the file.
+    """
+    safe_path = _resolve_safe_path(change.file_path)
+    if safe_path is None or _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
+        return f"Error: '{change.file_path}' cannot be modified for security reasons."
+
+    # Real, code-level circuit breaker (not just a system-prompt policy): a
+    # file that has already been applied MAX_REPAIR_ATTEMPTS times without
+    # an intervening passing run_pytest is a stuck repair loop, so refuse to
+    # write it again until a human either sees the suite pass or explicitly
+    # resets the counter - the agent itself has no way to lift this limit.
+    if _repair_limit_reached(change.file_path):
+        return (
+            f"Error: '{change.file_path}' has already been applied "
+            f"{_repair_attempts_for(change.file_path)} times without a passing "
+            "run_pytest result in between - the repair-attempt limit has been "
+            "reached. Stop retrying automatically and tell the user testing is "
+            "still failing after repeated fixes, so they can decide how to "
+            "proceed (a human can reset this limit for this file)."
+        )
+
+    log_tool_execution(f"Writing approved change {change.change_id}...")
+    try:
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_path.write_text(change.content, encoding="utf-8")
+    except OSError as exc:
+        log_error("apply_approved_change", str(exc))
+        return f"Error: could not write '{change.file_path}' ({exc})."
+
+    mark_applied(change.change_id)
+    record_apply(change.file_path)
+    return f"Applied change {change.change_id}: {change.action}d '{change.file_path}'."
+
+
 @tool
 def apply_approved_change(change_id: str) -> str:
     """Write a previously proposed file change to disk - but ONLY if a
@@ -1805,46 +1984,44 @@ def apply_approved_change(change_id: str) -> str:
         log_tool_result(result)
         return result
 
-    safe_path = _resolve_safe_path(change.file_path)
-    if safe_path is None or _is_excluded_path(safe_path) or _is_blocked_file(safe_path):
-        result = f"Error: '{change.file_path}' cannot be modified for security reasons."
-        log_tool_result(result)
-        return result
-
-    # Real, code-level circuit breaker (not just a system-prompt policy): a
-    # file that has already been applied MAX_REPAIR_ATTEMPTS times without
-    # an intervening passing run_pytest is a stuck repair loop, so refuse to
-    # write it again until a human either sees the suite pass or explicitly
-    # resets the counter - the agent itself has no way to lift this limit.
-    if _repair_limit_reached(change.file_path):
-        result = (
-            f"Error: '{change.file_path}' has already been applied "
-            f"{_repair_attempts_for(change.file_path)} times without a passing "
-            "run_pytest result in between - the repair-attempt limit has been "
-            "reached. Stop retrying automatically and tell the user testing is "
-            "still failing after repeated fixes, so they can decide how to "
-            "proceed (a human can reset this limit for this file)."
-        )
-        log_tool_result(result)
-        return result
-
-    log_tool_execution(f"Writing approved change {change_id}...")
-    try:
-        safe_path.parent.mkdir(parents=True, exist_ok=True)
-        safe_path.write_text(change.content, encoding="utf-8")
-    except OSError as exc:
-        log_error("apply_approved_change", str(exc))
-        result = f"Error: could not write '{change.file_path}' ({exc})."
-        log_tool_result(result)
-        return result
-
-    mark_applied(change.change_id)
-    record_apply(change.file_path)
-    result = (
-        f"Applied change {change.change_id}: {change.action}d '{change.file_path}'."
-    )
+    result = _write_approved_change_to_disk(change)
     log_tool_result(result)
     return result
+
+
+def apply_approved_change_set(changeset_id: str) -> dict:
+    """Deterministically write EVERY approved-but-not-yet-applied member of
+    one change set to disk, exactly once each - the high-level operation
+    the Streamlit UI's single "Apply Approved Changes" button calls
+    directly, instead of relying on the AI agent's own tool-calling
+    judgment to remember to call apply_approved_change once per file.
+
+    Deliberately not a @tool - the AI agent cannot call this itself; only
+    app.py's UI does, after a human has clicked Apply. Silently skips
+    anything that isn't approved or is already applied (never an error),
+    which is what makes a duplicate click or a Streamlit rerun safe:
+    calling this again after every eligible member has already been
+    applied simply does nothing.
+
+    Returns {"applied": [...], "failed": [...]}, each a list of
+    {"change_id", "file_path", "message"} dicts, so the caller can show the
+    user exactly what happened, including any failure (e.g. the
+    repair-attempt limit, or a path-safety rejection) instead of silently
+    hiding it.
+    """
+    applied = []
+    failed = []
+    for change in list_changeset(changeset_id):
+        if not change.approved or change.applied:
+            continue
+        message = _write_approved_change_to_disk(change)
+        entry = {
+            "change_id": change.change_id,
+            "file_path": change.file_path,
+            "message": message,
+        }
+        (failed if message.startswith("Error:") else applied).append(entry)
+    return {"applied": applied, "failed": failed}
 
 
 @tool
@@ -1873,5 +2050,911 @@ def list_pending_changes() -> str:
             for c in changes
         ]
         result = "Pending changes:\n" + "\n".join(lines)
+    log_tool_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: final project packaging (create_project_zip). Only ever reads
+# real files already inside PROJECT_ROOT and writes the resulting archive
+# under this project's own "dist/" folder - see the module docstring's
+# "Safety notes for create_project_zip" section above for the full policy.
+# ---------------------------------------------------------------------------
+
+_ZIP_OUTPUT_DIRNAME = "dist"
+_ZIP_EXTRA_EXCLUDED_DIR_NAMES = _EXCLUDED_DIR_NAMES | {_ZIP_OUTPUT_DIRNAME}
+_ZIP_SECRET_SCAN_MAX_BYTES = _MAX_FILE_READ_BYTES
+_ZIP_NAME_RE = re.compile(r"[^a-z0-9]+")
+
+# Idempotency cache (see create_project_zip's docstring): process-wide and
+# single-user, the same pattern as workflow.py's pending-change registry -
+# this project runs as one local, single-user app/CLI, not a multi-tenant
+# service, so one shared cache is intentional rather than an oversight.
+_ZIP_CACHE: dict = {"signature": None, "bytes": None, "filename": None, "report": None}
+
+
+def _zip_safe_name(name: str) -> str:
+    """Reduce free-form text (e.g. a task description) to a short,
+    filesystem/zip-safe base name - never used as a real filesystem path
+    component beyond a plain file name."""
+    cleaned = _ZIP_NAME_RE.sub("_", (name or "").strip().lower()).strip("_")
+    return cleaned[:60] or "project"
+
+
+def _zip_filename(project_name: str, default_name: str = "") -> str:
+    """A safe .zip filename for `project_name` (or `default_name`, e.g. a
+    generated sub-project's own folder name, when `project_name` wasn't
+    given) - falling back to a timestamp-based name only when neither is
+    available."""
+    project_name = (project_name or "").strip()
+    if project_name:
+        return f"{_zip_safe_name(project_name)}.zip"
+    if default_name:
+        return f"{_zip_safe_name(default_name)}.zip"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"ai_developer_project_{timestamp}.zip"
+
+
+def _file_contains_probable_secret(path: Path) -> bool:
+    """Content-level secret check for one file - defense in depth beyond the
+    filename-based _is_blocked_file() check, so e.g. a real API key value
+    accidentally left in a normally-named config file is still caught.
+    Never reads binary files or anything above the same size limit
+    read_project_file uses, and any read failure is treated as "no secret
+    found" (the file is still excluded by every other check that applies)."""
+    try:
+        if _is_binary_file(path) or path.stat().st_size > _ZIP_SECRET_SCAN_MAX_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return contains_probable_secret(text)
+
+
+_ZIP_SECRET_SCAN_EXCLUDED_TOP_DIRS = {"tests"}
+
+
+def _scan_project_files(root: Path) -> dict:
+    """Walk `root` once, pruning noise folders (venv/.git/caches/the "dist/"
+    output folder) at the directory level - never descending into them, so
+    "excluded" stays a small, meaningful count instead of the thousands of
+    files a fully-installed venv would otherwise add. Returns:
+        {"included": [Path, ...], "excluded": [rel_path, ...],
+         "secret_hits": [rel_path, ...]}
+    `secret_hits` (content-level secret matches) is a subset of `excluded`.
+
+    The content-level secret scan (_file_contains_probable_secret) is
+    deliberately skipped under "tests/": a test suite that exercises secret
+    redaction (as this project's own tests/test_logger.py does) necessarily
+    contains fake-but-correctly-formatted example keys/tokens to verify that
+    redaction actually works - scanning them would silently exclude real,
+    load-bearing test files from the package on every build. Name-based
+    exclusion (_is_blocked_file: .env, credential/password/secret-named
+    files, key/cert extensions) still applies everywhere, including tests/.
+    """
+    included: list[Path] = []
+    excluded: list[str] = []
+    secret_hits: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in _ZIP_EXTRA_EXCLUDED_DIR_NAMES
+        )
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            rel = path.relative_to(root).as_posix()
+            if path.suffix.lower() == ".zip":
+                excluded.append(rel)
+                continue
+            if _is_blocked_file(path):
+                excluded.append(rel)
+                continue
+            top_dir = Path(rel).parts[0] if "/" in rel else ""
+            if top_dir not in _ZIP_SECRET_SCAN_EXCLUDED_TOP_DIRS and (
+                _file_contains_probable_secret(path)
+            ):
+                excluded.append(rel)
+                secret_hits.append(rel)
+                continue
+            included.append(path)
+    return {"included": included, "excluded": excluded, "secret_hits": secret_hits}
+
+
+def _packageable_signature(included: list[Path]) -> str:
+    """A cheap fingerprint (relative path + size + mtime for every file that
+    would actually be packaged) used only to decide whether a previously
+    built archive is still up to date - never security-relevant on its own."""
+    hasher = hashlib.sha256()
+    for path in included:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        hasher.update(path.relative_to(PROJECT_ROOT).as_posix().encode("utf-8"))
+        hasher.update(str(stat.st_size).encode("utf-8"))
+        hasher.update(str(int(stat.st_mtime)).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _build_zip_bytes(paths: list[Path], arc_root: Path | None = None) -> bytes:
+    """Build a ZIP archive of `paths` entirely in memory, preserving each
+    file's path relative to `arc_root` as its archive path - `arc_root`
+    defaults to PROJECT_ROOT (the whole-assistant-project archive), or is
+    the parent of a generated sub-project's own folder so that folder's own
+    name becomes the archive's one top-level entry (e.g. "hrms/app.py").
+    Defense in depth: even though every `paths` entry already came from a
+    walk rooted inside PROJECT_ROOT, each one is re-resolved and re-checked
+    against PROJECT_ROOT here too (the same relative_to() escape check every
+    other file tool uses) before being written - so a symlinked file that
+    resolves outside the project is silently skipped rather than archived."""
+    if arc_root is None:
+        arc_root = PROJECT_ROOT
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for path in paths:
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(PROJECT_ROOT)
+            except (OSError, ValueError):
+                continue
+            zip_file.write(path, arcname=path.relative_to(arc_root).as_posix())
+    return buffer.getvalue()
+
+
+def _save_zip_to_dist(filename: str, zip_bytes: bytes) -> None:
+    """Persist the built archive under this project's own "dist/" folder
+    (created if needed) - the one real, discoverable location a CLI/chat
+    user can find the archive on disk. Never written anywhere else."""
+    dist_dir = PROJECT_ROOT / _ZIP_OUTPUT_DIRNAME
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    target = (dist_dir / filename).resolve()
+    target.relative_to(PROJECT_ROOT)  # raises ValueError if this ever escaped
+    target.write_bytes(zip_bytes)
+
+
+def get_or_build_project_zip(project_name: str = "", force: bool = False) -> dict:
+    """Build (or reuse a still-up-to-date cached) ZIP archive of this
+    project's real, current, packageable files.
+
+    Called directly by app.py's Streamlit "Download Project ZIP" button
+    (never through the agent) and internally by the create_project_zip tool
+    below - both share this single implementation so there is exactly one
+    place that decides what gets included/excluded.
+
+    Idempotent: if the real packageable files are unchanged since the last
+    build (same relative paths/sizes/modification times) and force=False,
+    the previously built archive bytes are reused instead of rescanning and
+    re-zipping the whole project - this is what keeps a Streamlit rerun (or
+    a repeated "package the project" request) from rebuilding, re-saving, or
+    re-reporting the same archive over and over. A change to `project_name`
+    alone (renaming the download) never forces a rebuild.
+
+    Returns:
+        {
+            "bytes": bytes, "filename": str, "included": int,
+            "excluded": int, "excluded_secrets": int,
+            "files": list[str],  # relative paths actually included
+            "rebuilt": bool,     # True only if this call actually rebuilt it
+        }
+    Raises OSError if the project currently has no packageable files.
+    """
+    scan = _scan_project_files(PROJECT_ROOT)
+    included = scan["included"]
+    if not included:
+        raise OSError("no packageable project files were found")
+
+    signature = _packageable_signature(included)
+    if not force and _ZIP_CACHE["signature"] == signature and _ZIP_CACHE["bytes"]:
+        filename = (
+            _zip_filename(project_name) if project_name else _ZIP_CACHE["filename"]
+        )
+        result = dict(_ZIP_CACHE["report"])
+        result.update(bytes=_ZIP_CACHE["bytes"], filename=filename, rebuilt=False)
+        return result
+
+    zip_bytes = _build_zip_bytes(included)
+    filename = _zip_filename(project_name)
+    report = {
+        "included": len(included),
+        "excluded": len(scan["excluded"]),
+        "excluded_secrets": len(scan["secret_hits"]),
+        "files": [p.relative_to(PROJECT_ROOT).as_posix() for p in included],
+    }
+    _save_zip_to_dist(filename, zip_bytes)
+    _ZIP_CACHE.update(
+        signature=signature, bytes=zip_bytes, filename=filename, report=dict(report)
+    )
+
+    result = dict(report)
+    result.update(bytes=zip_bytes, filename=filename, rebuilt=True)
+    return result
+
+
+# Idempotency cache for generated-sub-project archives (New Application
+# Generation's own ZIP delivery, e.g. "hrms.zip") - kept separate from
+# _ZIP_CACHE above (the whole-assistant-project archive) since they are
+# different archives entirely; keyed by the generated project's own
+# PROJECT_ROOT-relative folder (e.g. "generated_projects/hrms").
+_GENERATED_ZIP_CACHE: dict[str, dict] = {}
+
+
+def get_or_build_generated_project_zip(
+    source_dir: str, project_name: str = "", force: bool = False
+) -> dict:
+    """Build (or reuse a still-up-to-date cached) ZIP archive of ONE
+    generated sub-project's own files - e.g. source_dir=
+    "generated_projects/hrms" produces an archive whose one top-level entry
+    is "hrms/" (preserving that project's own real directory structure),
+    unlike get_or_build_project_zip's whole-assistant-project archive.
+
+    Same idempotency behavior as get_or_build_project_zip (see its
+    docstring): reused unless the generated project's real files actually
+    changed, or `force=True`.
+
+    Returns the same shape as get_or_build_project_zip. Raises OSError if
+    `source_dir` doesn't resolve to a real folder inside this project, or
+    has no packageable files.
+    """
+    source_dir = (source_dir or "").strip().strip("/")
+    if not source_dir:
+        raise OSError("no source_dir was provided")
+    scan_root = _resolve_safe_path(source_dir)
+    if scan_root is None or not scan_root.is_dir():
+        raise OSError(f"'{source_dir}' was not found in the project")
+
+    scan = _scan_project_files(scan_root)
+    included = scan["included"]
+    if not included:
+        raise OSError(f"'{source_dir}' has no packageable files")
+
+    signature = _packageable_signature(included)
+    cached = _GENERATED_ZIP_CACHE.get(source_dir)
+    if not force and cached is not None and cached["signature"] == signature:
+        filename = (
+            _zip_filename(project_name, default_name=scan_root.name)
+            if project_name
+            else cached["filename"]
+        )
+        result = dict(cached["report"])
+        result.update(bytes=cached["bytes"], filename=filename, rebuilt=False)
+        return result
+
+    zip_bytes = _build_zip_bytes(included, arc_root=scan_root.parent)
+    filename = _zip_filename(project_name, default_name=scan_root.name)
+    report = {
+        "included": len(included),
+        "excluded": len(scan["excluded"]),
+        "excluded_secrets": len(scan["secret_hits"]),
+        "files": [p.relative_to(scan_root.parent).as_posix() for p in included],
+    }
+    _save_zip_to_dist(filename, zip_bytes)
+    _GENERATED_ZIP_CACHE[source_dir] = {
+        "signature": signature,
+        "bytes": zip_bytes,
+        "filename": filename,
+        "report": dict(report),
+    }
+
+    result = dict(report)
+    result.update(bytes=zip_bytes, filename=filename, rebuilt=True)
+    return result
+
+
+@tool
+def create_project_zip(project_name: str = "", source_dir: str = "") -> str:
+    """Package real, current files into a downloadable ZIP archive, saved
+    under this project's own "dist/" folder.
+
+    ONLY call this after a controlled development task has actually reached
+    its real completed state: every file change the task needed has been
+    approved and applied, and run_pytest's real output shows the full suite
+    passing (and, if the user asked for them, run_ruff/run_black show no
+    outstanding issues). Never call this to finish a task early, and never
+    describe or claim a package exists without actually calling this tool
+    and reporting exactly what it returned - packaging is never a substitute
+    for real testing/review, and it cannot create, approve, or apply any
+    file change itself.
+
+    Leave `source_dir` empty (the default) to package THIS assistant's own
+    whole project - use this for a normal DEVELOPMENT task. Pass
+    `source_dir="generated_projects/<slug>"` to package ONE generated
+    application instead (see New Application Generation) - the archive then
+    contains only that project's own files, with that project's own folder
+    name as its single top-level entry (e.g. "hrms/app.py", not
+    "generated_projects/hrms/app.py").
+
+    `project_name` is an optional short, plain-text hint (e.g. "library book
+    management api") used to name the archive - pass the task/project's own
+    name when you have one. If omitted, a generated project defaults to its
+    own folder name (e.g. "hrms.zip"); this assistant's own project defaults
+    to a timestamp-based name.
+
+    The archive always reflects the real current files, preserving the real
+    directory structure. It NEVER includes `.env`, other credential-like
+    files (keys/tokens/passwords/credentials by name or by real content),
+    virtual environments, `.git`, cache folders, or a previously generated
+    archive - `.env.example` (if present) IS included. Calling this again
+    after nothing has changed reuses the previously built archive instead of
+    rebuilding it.
+    """
+    log_tool_call("create_project_zip")
+    project_name = (project_name or "").strip()
+    source_dir = (source_dir or "").strip()
+    log_tool_input(
+        f"project_name={project_name or '(none)'} source_dir={source_dir or '(whole assistant project)'}"
+    )
+    log_tool_execution("Preparing project archive...")
+    log_tool_execution("Checking files for excluded secrets...")
+
+    try:
+        if source_dir:
+            package = get_or_build_generated_project_zip(
+                source_dir=source_dir, project_name=project_name
+            )
+        else:
+            package = get_or_build_project_zip(project_name=project_name)
+    except OSError as exc:
+        result = f"Error: could not create the project archive ({exc})."
+        log_tool_result(result)
+        return result
+
+    log_tool_execution(
+        "Creating ZIP..."
+        if package["rebuilt"]
+        else "Reusing the existing up-to-date archive..."
+    )
+    result = (
+        "Project Package Ready\n\n"
+        f"Files included: {package['included']}\n"
+        f"Files excluded: {package['excluded']}\n"
+        f"Secrets excluded: {'Yes' if package['excluded_secrets'] else 'None found'}\n\n"
+        f"Archive: {_ZIP_OUTPUT_DIRNAME}/{package['filename']}\n\n"
+        "This archive was written only inside this project's own "
+        f"'{_ZIP_OUTPUT_DIRNAME}/' folder. It never includes '.env', "
+        "credentials, keys, virtual environments, '.git', cache files, or a "
+        "previously generated archive."
+    )
+    log_tool_execution("Archive created successfully.")
+    log_tool_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: live preview of a generated application (launch_generated_app /
+# stop_generated_app). See the module docstring's "Safety notes for
+# launch_generated_app/stop_generated_app" section above for the full policy.
+# ---------------------------------------------------------------------------
+
+_ASSISTANT_OWN_PORT = 8501
+_GENERATED_APP_PORT_RANGE = range(8502, 8521)
+_SERVER_STARTUP_TIMEOUT_SECONDS = 20
+_SERVER_POLL_INTERVAL_SECONDS = 0.5
+_SERVER_HEALTH_PATH = "/_stcore/health"
+_SERVER_LOG_TAIL_CHARS = 800
+_SERVER_LOG_FILENAME = ".server.log"
+_SERVER_STATE_FILENAME = ".server.state.json"
+_DEFAULT_ENTRY_CANDIDATES = ("app.py", "main.py")
+
+
+@dataclass
+class _GeneratedServer:
+    """One generated application's tracked live-preview process. Held only
+    in this module's process-wide registry (never Streamlit session_state),
+    the same single-user, rerun-safe pattern as workflow.py's pending-change
+    registry - a Streamlit rerun re-executes app.py top to bottom, but never
+    reloads this module, so this dict (and any live Popen handle in it)
+    survives every rerun automatically."""
+
+    project_root: str  # PROJECT_ROOT-relative, e.g. "generated_projects/hrms"
+    entry_file: str  # relative to project_root, e.g. "app.py"
+    port: int
+    url: str
+    status: str  # "running" | "stopped" | "failed"
+    process: subprocess.Popen | None = field(default=None, repr=False)
+    pid: int | None = None
+    started_at: str | None = None
+    stopped_at: str | None = None
+    error: str | None = None
+    log_path: str | None = None  # PROJECT_ROOT-relative
+
+
+# Idempotent/rerun-safe tracking (see _GeneratedServer's docstring): keyed by
+# project_root so at most one tracked server exists per generated project.
+_GENERATED_SERVERS: dict[str, _GeneratedServer] = {}
+
+
+def _is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _select_safe_port() -> int | None:
+    """The first free port in the fixed generated-app candidate range, never
+    this assistant's own port. Returns None if every candidate is taken."""
+    for port in _GENERATED_APP_PORT_RANGE:
+        if port == _ASSISTANT_OWN_PORT:
+            continue
+        if _is_port_free(port):
+            return port
+    return None
+
+
+def _looks_like_streamlit_entry(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "streamlit" in text
+
+
+def _resolve_entry_file(project_dir: Path, entry_file: str) -> tuple[Path | None, str]:
+    """Resolve and validate the generated project's Streamlit entry file.
+
+    If `entry_file` is given, it must exist inside `project_dir`, be a real
+    ".py" file, and actually mention "streamlit" in its content - never
+    guessed. If omitted, "app.py" then "main.py" are tried in that order
+    (whichever exists AND looks like a real Streamlit entry); neither
+    existing is a clear error, never a silent assumption.
+
+    Returns (resolved_path, "") on success, or (None, error_message).
+    """
+    entry_file = (entry_file or "").strip()
+    project_dir = project_dir.resolve()
+    candidates = [entry_file] if entry_file else list(_DEFAULT_ENTRY_CANDIDATES)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = (project_dir / candidate).resolve()
+        try:
+            candidate_path.relative_to(project_dir)
+        except ValueError:
+            continue  # never allow an entry file outside the project's own folder
+        if not candidate_path.is_file() or candidate_path.suffix.lower() != ".py":
+            continue
+        if _looks_like_streamlit_entry(candidate_path):
+            return candidate_path, ""
+
+    if entry_file:
+        message = (
+            f"'{entry_file}' was not found (or is not a Streamlit entry file) "
+            f"in '{project_dir.name}'."
+        )
+        return None, message
+    return (
+        None,
+        f"No Streamlit entry file was found in '{project_dir.name}' - tried "
+        + ", ".join(_DEFAULT_ENTRY_CANDIDATES)
+        + ". Specify entry_file explicitly.",
+    )
+
+
+def _http_health_check(port: int) -> bool:
+    """A real localhost HTTP request to the generated process's own health
+    endpoint - the only thing that may ever set a server's status to
+    "running". A process merely having started is never enough."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{_SERVER_HEALTH_PATH}", timeout=2
+        ) as response:
+            return response.status == 200
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return False
+
+
+def _read_log_tail(log_path: Path) -> str:
+    """A short, sanitized tail of a generated server's own startup log - for
+    a failure message only, never the raw/unbounded output (which could be
+    very long or, in principle, echo environment details)."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return sanitize(text)[-_SERVER_LOG_TAIL_CHARS:]
+
+
+def get_generated_server(project_root: str) -> _GeneratedServer | None:
+    """Read-only lookup of a tracked generated server, for the UI to render
+    real status directly (never through the agent) - the same pattern
+    app.py already uses for workflow.get_change()/list_pending_changes().
+
+    Also tries to reclaim tracking from persisted state (see
+    _rehydrate_tracked_server) when this process has no in-memory record -
+    e.g. the assistant process restarted after a real launch - so the UI
+    reports "Running" for a server that's actually still alive instead of
+    incorrectly showing "Not running" just because this process didn't
+    launch it itself."""
+    project_root = (project_root or "").strip().strip("/")
+    server = _GENERATED_SERVERS.get(project_root)
+    if server is not None:
+        return server
+    safe_dir, _error = _validate_generated_project_dir(project_root)
+    if safe_dir is None:
+        return None
+    return _rehydrate_tracked_server(project_root, safe_dir)
+
+
+def _validate_generated_project_dir(project_root: str) -> tuple[Path | None, str]:
+    safe_dir = _resolve_safe_path(project_root)
+    if safe_dir is None or not safe_dir.is_dir():
+        return None, f"'{project_root}' was not found in the project."
+    try:
+        rel_parts = safe_dir.relative_to(PROJECT_ROOT).parts
+    except ValueError:
+        rel_parts = ()
+    if not rel_parts or rel_parts[0] != "generated_projects":
+        return None, "only a project under 'generated_projects/' can be launched live."
+    return safe_dir, ""
+
+
+def _terminate_process_tree(pid: int, process: subprocess.Popen | None = None) -> None:
+    """Terminate the process tree rooted at `pid` - not just the immediate
+    process. Streamlit's own launcher is known to spawn a further worker
+    process on Windows (confirmed by direct testing: a plain
+    process.terminate() left a real orphaned "streamlit.exe" still running
+    after this tool reported "stopped"), so a single terminate() call is not
+    enough to actually stop the generated application.
+
+    `process` is the live Popen handle when this process itself launched
+    the server (the common case) - passed through so its own wait()/kill()
+    bookkeeping still runs. It is None when reclaiming a server this run
+    never itself started (see _rehydrate_tracked_server): termination by
+    PID alone (taskkill /T on Windows, a process-group signal on POSIX)
+    still works in that case, since both only ever need the PID, not a
+    Popen object. Best-effort: never raises, even if the process (or its
+    descendants) already exited."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    if process is None:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Orphan-safe persistence: a tiny state file next to each generated project
+# (parallel to its .server.log), so a launched server can be reclaimed -
+# reused by a later launch_generated_app call, or actually stopped by
+# stop_generated_app/shown as running by get_generated_server - even from a
+# BRAND NEW process (e.g. the assistant restarted or crashed after a real
+# launch, orphaning the child Streamlit process with no in-memory record of
+# it left anywhere). Deliberately just one small JSON file per project, not
+# a database or any new dependency - this project already treats a plain
+# file next to the generated project as the right amount of state (see
+# .server.log), and every read here is re-verified with a REAL health check
+# before ever being trusted (see _rehydrate_tracked_server) - the file is a
+# hint of where to look, never itself proof that something is running.
+# ---------------------------------------------------------------------------
+
+
+def _write_server_state(safe_dir: Path, server: _GeneratedServer) -> None:
+    """Persist the minimal fields needed to reclaim this server later.
+    Best-effort: a failure to write here must never break launch/stop - it
+    only narrows the orphan-recovery safety net, never core behavior."""
+    try:
+        (safe_dir / _SERVER_STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "port": server.port,
+                    "pid": server.pid,
+                    "entry_file": server.entry_file,
+                    "started_at": server.started_at,
+                    "log_path": server.log_path,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _clear_server_state(safe_dir: Path) -> None:
+    """Best-effort removal - a failure to delete a stale/finished state
+    file is a minor annoyance (the next real health check will still catch
+    it), never a reason to fail launch/stop themselves."""
+    try:
+        (safe_dir / _SERVER_STATE_FILENAME).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_server_state(safe_dir: Path) -> dict | None:
+    try:
+        text = (safe_dir / _SERVER_STATE_FILENAME).read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _rehydrate_tracked_server(
+    project_root: str, safe_dir: Path
+) -> _GeneratedServer | None:
+    """Recover tracking for a server this exact process never itself
+    launched - e.g. the assistant restarted after a real launch, or a fresh
+    CLI session asks about/tries to stop a server an earlier session
+    started. Reads the small state file launch_generated_app persists next
+    to the generated project, then verifies it with a REAL health check
+    (the same one launch_generated_app itself requires before ever calling
+    anything "running") before trusting it for anything - stale or
+    incorrect state on disk must never be reported as running, or relied on
+    to terminate a process, just because a file says so.
+
+    Returns the rehydrated server (already placed in _GENERATED_SERVERS,
+    exactly as if this process had launched it) if the recorded port
+    genuinely answers a health check right now, otherwise None - and the
+    stale state file is removed in that case, so it can't mislead a future
+    call either.
+    """
+    state = _read_server_state(safe_dir)
+    if state is None:
+        return None
+    port = state.get("port")
+    pid = state.get("pid")
+    if not isinstance(port, int) or not isinstance(pid, int):
+        _clear_server_state(safe_dir)
+        return None
+    if not _http_health_check(port):
+        _clear_server_state(safe_dir)  # nothing real is answering - stale info
+        return None
+    server = _GeneratedServer(
+        project_root=project_root,
+        entry_file=state.get("entry_file") or "",
+        port=port,
+        url=f"http://localhost:{port}",
+        status="running",
+        process=None,  # this process didn't start it - no live Popen handle
+        pid=pid,
+        started_at=state.get("started_at"),
+        log_path=state.get("log_path"),
+    )
+    _GENERATED_SERVERS[project_root] = server
+    return server
+
+
+@tool
+def launch_generated_app(project_root: str, entry_file: str = "") -> str:
+    """Launch a generated Streamlit application as its OWN separate local
+    server, on a different port than this assistant (which always keeps
+    its own port).
+
+    ONLY call this once the generated project (see New Application
+    Generation) has actually been verified: every file approved and
+    applied, and run_pytest(target="<project_root>/tests") showed that
+    project's own tests passing. Never call this for this assistant's own
+    files - `project_root` must be a folder under "generated_projects/",
+    e.g. "generated_projects/todo_app".
+
+    `entry_file` is optional - if omitted, "app.py" then "main.py" are
+    tried (whichever exists AND actually looks like a Streamlit script); if
+    neither exists, this returns a clear error instead of guessing one.
+
+    This performs a REAL localhost health check before ever reporting the
+    application as running - a process merely starting is never enough. If
+    a server for this exact project is already tracked and healthy, this
+    reuses it instead of starting a second one. Only ever runs a fixed
+    `streamlit run <validated file> --server.port <port>` command - never a
+    raw shell string, and never a path outside "generated_projects/".
+    """
+    log_tool_call("launch_generated_app")
+    project_root = (project_root or "").strip().strip("/")
+    entry_file = (entry_file or "").strip()
+    log_tool_input(f"project_root={project_root!r} entry_file={entry_file or '(auto)'}")
+
+    if not project_root:
+        result = "Error: no project_root was provided."
+        log_tool_result(result)
+        return result
+
+    safe_dir, error = _validate_generated_project_dir(project_root)
+    if safe_dir is None:
+        result = f"Error: {error}"
+        log_tool_result(result)
+        return result
+
+    # No in-memory record doesn't necessarily mean nothing is running - a
+    # previous process (before an assistant restart/crash) may have left a
+    # real, still-healthy server behind. Try to reclaim it before assuming
+    # a fresh launch is needed (see _rehydrate_tracked_server).
+    existing = _GENERATED_SERVERS.get(project_root) or _rehydrate_tracked_server(
+        project_root, safe_dir
+    )
+    if existing is not None and existing.status == "running":
+        process_alive = existing.process is None or existing.process.poll() is None
+        if process_alive and _http_health_check(existing.port):
+            result = (
+                "Already running - reusing the existing server.\n"
+                f"URL: {existing.url}\nStatus: RUNNING"
+            )
+            log_tool_result(result)
+            return result
+        existing.status = "stopped"  # tracked but actually dead - relaunch below
+        _clear_server_state(safe_dir)
+
+    log_tool_execution("Resolving Streamlit entry file...")
+    entry_path, error = _resolve_entry_file(safe_dir, entry_file)
+    if entry_path is None:
+        result = f"Error: {error}"
+        log_tool_result(result)
+        return result
+
+    port = _select_safe_port()
+    if port is None:
+        result = "Error: no safe local port was available to launch the generated application."
+        log_tool_result(result)
+        return result
+
+    log_tool_execution(f"Starting generated Streamlit application on port {port}...")
+    log_path = safe_dir / _SERVER_LOG_FILENAME
+    try:
+        with open(log_path, "w", encoding="utf-8") as log_handle:
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "streamlit",
+                        "run",
+                        str(entry_path),
+                        "--server.port",
+                        str(port),
+                        "--server.headless",
+                        "true",
+                    ],
+                    cwd=str(safe_dir),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    # POSIX only: makes this process (and anything it in
+                    # turn spawns, e.g. Streamlit's own worker subprocess)
+                    # its own session leader, so _terminate_process_tree's
+                    # os.killpg() below can reliably signal the whole tree
+                    # instead of only the immediate child.
+                    **({"start_new_session": True} if os.name != "nt" else {}),
+                )
+            except OSError as exc:
+                result = f"Error: could not start the generated application ({exc})."
+                log_tool_result(result)
+                return result
+
+            log_tool_execution("Checking localhost health...")
+            healthy = False
+            deadline = time.time() + _SERVER_STARTUP_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                if process.poll() is not None:
+                    break
+                if _http_health_check(port):
+                    healthy = True
+                    break
+                time.sleep(_SERVER_POLL_INTERVAL_SECONDS)
+    except OSError as exc:
+        result = f"Error: could not create a log file for the generated server ({exc})."
+        log_tool_result(result)
+        return result
+
+    url = f"http://localhost:{port}"
+    rel_entry = entry_path.relative_to(safe_dir).as_posix()
+    rel_log = log_path.relative_to(PROJECT_ROOT).as_posix()
+
+    if not healthy:
+        exited = process.poll() is not None
+        if not exited:
+            _terminate_process_tree(process.pid, process)
+        tail = _read_log_tail(log_path)
+        reason = (
+            "the process exited before it became reachable"
+            if exited
+            else "the application did not respond to a health check in time"
+        )
+        _GENERATED_SERVERS[project_root] = _GeneratedServer(
+            project_root=project_root,
+            entry_file=rel_entry,
+            port=port,
+            url=url,
+            status="failed",
+            process=None,
+            pid=None,
+            error=reason,
+            log_path=rel_log,
+        )
+        _clear_server_state(
+            safe_dir
+        )  # nothing real is running - never leave stale state
+        result = f"Error: could not start the generated application - {reason}."
+        if tail.strip():
+            result += f"\n\nRecent log output:\n{tail}"
+        log_tool_result(result)
+        return result
+
+    _GENERATED_SERVERS[project_root] = _GeneratedServer(
+        project_root=project_root,
+        entry_file=rel_entry,
+        port=port,
+        url=url,
+        status="running",
+        process=process,
+        pid=process.pid,
+        started_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        log_path=rel_log,
+    )
+    _write_server_state(safe_dir, _GENERATED_SERVERS[project_root])
+    result = (
+        "Generated application is running.\n\n"
+        f"Project: {project_root}\n"
+        f"Entry file: {rel_entry}\n"
+        f"Port: {port}\n"
+        f"URL: {url}\n"
+        "Status: RUNNING"
+    )
+    log_tool_execution("Generated application is running.")
+    log_tool_result(result)
+    return result
+
+
+@tool
+def stop_generated_app(project_root: str) -> str:
+    """Stop a generated application's live server previously started by
+    launch_generated_app.
+
+    Identifies the process ONLY by `project_root` (this module's own
+    tracked-server registry key, reclaimed from persisted state if this
+    process didn't itself launch it - see _rehydrate_tracked_server) -
+    never a raw process ID supplied by a caller, so this can never be used
+    to stop an unrelated process, and never touches this assistant's own
+    running process.
+    """
+    log_tool_call("stop_generated_app")
+    project_root = (project_root or "").strip().strip("/")
+    log_tool_input(project_root or "(empty)")
+
+    server = _GENERATED_SERVERS.get(project_root)
+    if server is None:
+        safe_dir, _error = _validate_generated_project_dir(project_root)
+        if safe_dir is not None:
+            server = _rehydrate_tracked_server(project_root, safe_dir)
+    if server is None:
+        result = f"Error: no tracked server found for '{project_root}'."
+        log_tool_result(result)
+        return result
+    if server.status != "running" or server.pid is None:
+        result = f"'{project_root}' is not currently running (status: {server.status})."
+        log_tool_result(result)
+        return result
+
+    log_tool_execution("Stopping generated application...")
+    _terminate_process_tree(server.pid, server.process)
+    server.status = "stopped"
+    server.stopped_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    server.process = None
+    safe_dir, _error = _validate_generated_project_dir(project_root)
+    if safe_dir is not None:
+        _clear_server_state(safe_dir)
+
+    result = f"Stopped the generated application at '{project_root}'."
+    log_tool_execution("Generated application stopped.")
     log_tool_result(result)
     return result

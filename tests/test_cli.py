@@ -10,11 +10,19 @@ monkeypatched at the module level, the same pattern test_agent.py uses for
 `ask_agent`/`classify_request`).
 """
 
+import io
+
 import pytest
 
 import cli as cli_module
 import workflow
-from cli import _MAX_APPROVAL_ROUNDS, _handle_pending_approvals, _run_turn
+from cli import (
+    _MAX_APPROVAL_ROUNDS,
+    _handle_pending_approvals,
+    _print_pending_change,
+    _run_turn,
+    main,
+)
 
 
 class _FakeAgent:
@@ -123,6 +131,70 @@ def test_run_turn_returns_answer_directly_when_nothing_is_pending(monkeypatch):
     assert len(conversation) == 1  # just the AI reply was recorded
 
 
+def test_run_turn_does_not_crash_on_a_legacy_console_codepage(monkeypatch):
+    """Regression test: a real Gemini answer containing an emoji (folder
+    icon) crashed a bare print() with UnicodeEncodeError on a simulated
+    legacy Windows console codepage (cp1252) - _run_turn must use
+    logger.safe_print, not print(), for the "Assistant: ..." line so an
+    emoji in the model's own answer can never kill the CLI session."""
+    answer_with_emoji = "Here is the ### \U0001f4c1 Project Structure"
+    monkeypatch.setattr(
+        cli_module,
+        "run_agent_turn",
+        lambda agent, conversation: {
+            "answer": answer_with_emoji,
+            "pending_change_ids": [],
+        },
+    )
+
+    buffer = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", newline=""
+    )
+    monkeypatch.setattr("sys.stdout", buffer)
+
+    answer = _run_turn(_FakeAgent(), [])  # must not raise UnicodeEncodeError
+    buffer.flush()
+
+    assert answer == answer_with_emoji
+    buffer.seek(0)
+    printed = buffer.buffer.getvalue().decode("cp1252")
+    assert "Assistant:" in printed
+    assert "?" in printed  # the emoji was replaced, not left to crash printing
+
+
+def test_print_pending_change_does_not_crash_on_a_legacy_console_codepage(
+    monkeypatch,
+):
+    """Regression test for a real crash found in live testing: a proposed
+    file's own content (e.g. a generated Streamlit app that legitimately
+    uses emoji in its UI copy) crashed the ENTIRE CLI session with
+    UnicodeEncodeError on a legacy Windows console codepage (cp1252) -
+    _print_pending_change used a bare print(change.content) instead of
+    logger.safe_print, the exact bug already fixed for the "Assistant: ..."
+    line (see test_run_turn_does_not_crash_on_a_legacy_console_codepage)
+    but missed here."""
+    change = workflow.register_change(
+        file_path="generated_projects/demo/app.py",
+        action="create",
+        content='st.write("\U0001f4dd Notes")',
+        reason="Add a \U0001f4dd notes section",
+    )
+
+    buffer = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", newline=""
+    )
+    monkeypatch.setattr("sys.stdout", buffer)
+
+    _print_pending_change(change)  # must not raise UnicodeEncodeError
+    buffer.flush()
+
+    buffer.seek(0)
+    printed = buffer.buffer.getvalue().decode("cp1252")
+    assert "APPROVAL REQUIRED" in printed
+    assert change.file_path in printed
+    assert "?" in printed  # the emoji was replaced, not left to crash printing
+
+
 def test_run_turn_prompts_for_approval_and_continues_once_approved(monkeypatch):
     change = workflow.register_change("a.py", "create", "x = 1\n", "demo")
     calls = []
@@ -189,3 +261,37 @@ def test_run_turn_never_exceeds_max_approval_rounds(monkeypatch):
     _run_turn(_FakeAgent(), conversation)
 
     assert len(calls) == _MAX_APPROVAL_ROUNDS + 1
+
+
+# ---------------------------------------------------------------------------
+# main()'s API key gate - a genuinely missing key must still stop with a
+# clear message, but a key that merely doesn't match the traditional
+# "AIza..." shape must not block startup (only a real rejection from
+# Google's API should ever be treated as proof a key is invalid).
+# ---------------------------------------------------------------------------
+
+_FAKE_INVALID_FORMAT_KEY = "AQ.FakeNonGeminiTokenForTestingOnly1234567890"
+
+
+def test_main_stops_with_clear_message_when_api_key_missing(monkeypatch, capsys):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    main()
+    assert "not configured" in capsys.readouterr().out
+
+
+def test_main_proceeds_past_a_differently_shaped_key(monkeypatch, capsys):
+    """A key shaped like the real 'AQ.'-prefixed credential from a past
+    support case must not stop the CLI - it must reach build_agent()
+    (mocked here so no real network call is made)."""
+    monkeypatch.setenv("GOOGLE_API_KEY", _FAKE_INVALID_FORMAT_KEY)
+    monkeypatch.setattr(cli_module, "build_agent", lambda: _FakeAgent())
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError())
+    )
+
+    main()
+
+    out = capsys.readouterr().out
+    assert "does not look like a valid gemini api key" not in out.lower()
+    assert "CLI mode" in out
+    assert _FAKE_INVALID_FORMAT_KEY not in out

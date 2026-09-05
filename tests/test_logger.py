@@ -11,7 +11,14 @@ import io
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agent import ask_agent
-from logger import log_error, log_tool_call, log_tool_result, sanitize
+from logger import (
+    get_recent_events,
+    log_error,
+    log_perf,
+    log_tool_call,
+    log_tool_result,
+    sanitize,
+)
 from tools import calculator
 
 
@@ -47,6 +54,23 @@ def test_sanitize_redacts_generic_token_and_password():
 def test_sanitize_leaves_normal_text_untouched():
     text = "125 * 48 = 6000"
     assert sanitize(text) == text
+
+
+def test_log_perf_prints_a_perf_line(capsys):
+    log_perf("Classification LLM call", 1.5)
+    captured = capsys.readouterr()
+    assert "[PERF] Classification LLM call: 1.50s" in captured.out
+
+
+def test_log_perf_never_reaches_the_ui_event_buffer():
+    """[PERF] lines are a terminal-only debugging aid - they must never be
+    added to the in-memory event buffer the Streamlit "Agent Logs" panel
+    reads back with get_recent_events(), so they never clutter what an end
+    user sees."""
+    before = len(get_recent_events())
+    log_perf("Total request (simple)", 0.42)
+    after = len(get_recent_events())
+    assert after == before
 
 
 def test_log_functions_do_not_raise_and_do_not_change_return_value(capsys):

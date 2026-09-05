@@ -31,7 +31,9 @@ import tools
 import workflow
 from agent import (
     AGENT_TEMPERATURE,
+    api_key_looks_valid,
     build_agent,
+    describe_agent_error,
     get_api_key,
     get_model_name,
     new_ai_message,
@@ -39,7 +41,7 @@ from agent import (
     run_agent_turn,
     transcribe_audio,
 )
-from logger import clear_events, get_recent_events, log_error
+from logger import clear_events, get_recent_events, log_error, log_perf
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -318,6 +320,9 @@ TOOL_DISPLAY_NAMES = {
     "propose_file_change": "📝 Proposing File Change",
     "apply_approved_change": "✅ Applying Approved Change",
     "list_pending_changes": "🔧 Checking Pending Changes",
+    "create_project_zip": "📦 Packaging Project",
+    "launch_generated_app": "🚀 Launching Generated Application",
+    "stop_generated_app": "🛑 Stopping Generated Application",
 }
 
 # "Execution Plan" list: what a turn's tool calls actually did, in order -
@@ -344,6 +349,9 @@ EXECUTION_STEP_LABELS = {
     "github_get_issues": "Fetch GitHub issues",
     "github_get_pull_requests": "Fetch GitHub pull requests",
     "list_pending_changes": "Check pending changes",
+    "create_project_zip": "Package the project into a ZIP",
+    "launch_generated_app": "Launch the generated application live",
+    "stop_generated_app": "Stop the generated application",
 }
 
 # Compact 7-step task strip (Chat page). Each step's "done" state is derived
@@ -357,6 +365,8 @@ _TASK_STEPS = [
     ("Implement", {"IMPLEMENTING"}),
     ("Test", {"TESTING", "ANALYZING", "FIXING", "RETESTING", "REGRESSION_TESTING"}),
     ("Review", {"REVIEWING", "COMPLETED"}),
+    ("Package", {"PACKAGING"}),
+    ("Live Preview", {"LIVE_PREVIEW"}),
 ]
 
 # Home page shortcuts: real prompts sent through the real agent pipeline
@@ -610,7 +620,7 @@ def _run_and_render_turn(
                 workflow_states = result.get("workflow_states", [])
             except Exception as exc:  # noqa: BLE001
                 print(f"[agent error] {exc}")
-                answer = "⚠️ I couldn't process that request. Please check your API key or try again."
+                answer = f"⚠️ {describe_agent_error(exc)}"
                 tool_calls = []
                 workflow_states = []
         turn_duration = time.time() - turn_started_at
@@ -635,28 +645,89 @@ def _run_and_render_turn(
     st.session_state.lc_history.append(new_ai_message(answer))
 
 
-def _approve_and_resume(agent, change: workflow.ProposedChange) -> None:
-    """Approve one change via the real Phase 6 approval registry
-    (workflow.approve_change), then drive the SAME agent through
-    run_agent_turn's existing bounded auto-continuation loop to actually
-    apply it, run the tests, and fix/retest within the existing
-    repair-attempt limit - exactly what typing "apply it" would already do,
-    triggered automatically instead of requiring that follow-up message."""
-    workflow.approve_change(change.change_id)
+def _approve_changeset(changeset_id: str) -> None:
+    """Approve every member of ONE Phase 6 change set as a single human
+    action (workflow.approve_change_set) - the entire simplified UI's first
+    of exactly two actions. Deliberately does NOT modify files, run tests,
+    or call apply_approved_change: Approve only moves state from PENDING to
+    APPROVED, nothing else - Apply (see _apply_changeset_and_resume) is a
+    separate, later action.
+
+    workflow.approve_change_set() is idempotent: it returns the change_ids
+    it actually just approved, empty if the whole set was already approved
+    (e.g. a duplicate click, or a Streamlit rerun re-delivering the same
+    click event) - in that case this is a deliberate no-op, so a single
+    click can never announce, or count, the same approval twice.
+    """
+    newly_approved = workflow.approve_change_set(changeset_id)
+    if not newly_approved:
+        return
+    if len(newly_approved) == 1:
+        message = "✅ The proposed change has been approved."
+    else:
+        message = f"✅ All {len(newly_approved)} proposed changes have been approved."
+    st.session_state.messages.append(
+        {"role": "assistant", "content": message, "tool_calls": []}
+    )
+    st.rerun()
+
+
+def _apply_changeset_and_resume(agent, changeset_id: str) -> None:
+    """Deterministically write EVERY approved-but-not-yet-applied member of
+    one change set to disk exactly once (tools.apply_approved_change_set -
+    never left to the AI agent's own tool-calling judgment to remember to
+    call apply_approved_change once per file), then drive the SAME agent
+    through run_agent_turn's existing bounded auto-continuation loop to run
+    the tests, analyze/fix, and report - exactly what Phase 6 steps 5+
+    already do, triggered automatically instead of requiring a follow-up
+    message.
+
+    Idempotent: if every member is already applied (e.g. a duplicate click,
+    or a Streamlit rerun re-delivering the same click), apply_approved_
+    change_set() reports nothing newly applied and this is a deliberate
+    no-op - no second "applied successfully" message, no second agent turn,
+    no file written twice.
+    """
+    outcome = tools.apply_approved_change_set(changeset_id)
+    applied = outcome["applied"]
+    failed = outcome["failed"]
+    if not applied and not failed:
+        return  # already fully applied - nothing left to do
+
+    if not applied:
+        # Nothing was actually written (e.g. the repair-attempt limit was
+        # already reached) - say so plainly. No agent turn to nudge into
+        # testing changes that were never written.
+        detail = "; ".join(f"{e['file_path']}: {e['message']}" for e in failed)
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": f"⚠️ Could not apply the approved changes. {detail}",
+                "tool_calls": [],
+            }
+        )
+        st.rerun()
+        return
+
+    summary = (
+        f"✅ {len(applied)} approved change{'s' if len(applied) != 1 else ''} "
+        "applied successfully."
+    )
+    if failed:
+        summary += " ⚠️ " + "; ".join(
+            f"{e['file_path']}: {e['message']}" for e in failed
+        )
+
+    change_list = ", ".join(f"{e['change_id']} ({e['file_path']})" for e in applied)
     nudge = (
-        f"The user has approved change '{change.change_id}' "
-        f"({change.action} {change.file_path}). Apply it with "
-        "apply_approved_change, then run the test suite; if it fails, fix the "
-        "issue and retest within the existing repair-attempt limit. Finish "
-        "with a short summary of what changed and the final test result."
+        f"The following approved change(s) have already been applied to disk: "
+        f"{change_list}. Run the complete test suite now, analyze any failure, "
+        "propose a fix if needed (it will need its own approval), and continue "
+        "the existing Phase 6 workflow (regression testing, Ruff, Black, final "
+        "verification). Finish with a concise summary."
     )
-    displayed = (
-        f"✅ Approved change `{change.change_id}` ({change.file_path}). "
-        "Please apply it."
-    )
-    _run_and_render_turn(
-        agent, displayed, nudge, spinner_text="Applying the approved change..."
-    )
+    _run_and_render_turn(agent, summary, nudge, spinner_text="Applying and testing...")
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +858,7 @@ def _current_task() -> dict | None:
 
 
 def _task_progress(states: list[str]) -> list[tuple[str, str]]:
-    """Map real workflow_states onto the compact 7-step task strip.
+    """Map real workflow_states onto the compact task strip.
     Returns (label, status) where status is 'done'/'active'/'pending'."""
     state_set = set(states)
     current = states[-1] if states else None
@@ -801,6 +872,182 @@ def _task_progress(states: list[str]) -> list[tuple[str, str]]:
             status = "pending"
         rows.append((label, status))
     return rows
+
+
+def _render_project_package_section(task: dict | None) -> None:
+    """Once this session's development task has actually reached the real
+    COMPLETED workflow state - see agent.py's run_agent_turn, which derives
+    COMPLETED only from a genuine passing run_pytest with nothing else
+    pending - offer a verified, downloadable ZIP of the project's current
+    real files. Never shown before that point, and never a fabricated
+    "success" - if the project can't actually be packaged, this shows a
+    real error instead of a download button.
+
+    Calls tools.get_or_build_project_zip() directly (never through the
+    agent), the same way the Project/Git pages already call read-only tools
+    directly for a plain button click - and that function is itself
+    idempotent (see its docstring), so re-rendering this section on every
+    Streamlit rerun never rebuilds/re-saves the archive unless the project's
+    real files actually changed.
+    """
+    if not task or "COMPLETED" not in task["states"]:
+        return
+
+    pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
+    if not pytest_calls:
+        return
+    tests_passed = _parse_pytest_output(pytest_calls[-1]["output"])["exit_code"] == 0
+    if not tests_passed:
+        return  # never offer a package unless the real test suite actually passed
+
+    ruff_calls = _find_tool_calls(st.session_state.messages, "run_ruff")
+    black_calls = _find_tool_calls(st.session_state.messages, "run_black")
+    ruff_passed = (
+        "no issues" in str(ruff_calls[-1]["output"]).lower() if ruff_calls else None
+    )
+    black_passed = (
+        not str(black_calls[-1]["output"]).lower().startswith("error")
+        if black_calls
+        else None
+    )
+
+    def _status_pill(label: str, state: bool | None) -> str:
+        if state is None:
+            return f'<span class="pill neutral">{label}: Not run</span>'
+        pill_class = "success" if state else "error"
+        return f'<span class="pill {pill_class}">{label}: {"PASS" if state else "FAIL"}</span>'
+
+    st.write("")
+    with st.container(border=True):
+        st.markdown("#### 📦 Project Completed ✅")
+        st.markdown(
+            " &nbsp; ".join(
+                [
+                    _status_pill("Tests", tests_passed),
+                    _status_pill("Ruff", ruff_passed),
+                    _status_pill("Black", black_passed),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        try:
+            package = tools.get_or_build_project_zip(project_name=task["task"])
+        except OSError as exc:
+            log_error("get_or_build_project_zip_ui", exc)
+            st.error("⚠️ Could not create the project archive.")
+            return
+
+        secrets_note = (
+            f"{package['excluded_secrets']} file(s) excluded"
+            if package["excluded_secrets"]
+            else "None found"
+        )
+        st.caption(
+            f"Files included: {package['included']} · "
+            f"Files excluded: {package['excluded']} · "
+            f"Secrets excluded: {secrets_note}"
+        )
+        st.download_button(
+            "⬇️ Download Project ZIP",
+            data=package["bytes"],
+            file_name=package["filename"],
+            mime="application/zip",
+            use_container_width=True,
+            key="download_project_zip",
+        )
+
+
+def _current_generated_project_root() -> str | None:
+    """The generated_projects/<slug> root this session most recently
+    actually applied a change to, if any - derived only from real
+    apply_approved_change tool calls resolved through the real change
+    registry (workflow.get_change), never guessed from chat text."""
+    for tool_call in reversed(
+        _find_tool_calls(st.session_state.messages, "apply_approved_change")
+    ):
+        change_id = tool_call["input"].get("change_id", "")
+        change = workflow.get_change(change_id)
+        if change is None or not change.applied:
+            continue
+        file_path = change.file_path
+        if file_path.startswith("generated_projects/"):
+            parts = file_path.split("/")
+            if len(parts) >= 2:
+                return "/".join(parts[:2])
+    return None
+
+
+def _generated_project_tests_passed(project_root: str) -> bool:
+    """True only if the most recent run_pytest call actually targeting this
+    exact generated project's own tests reported a real passing exit code -
+    never inferred from anything else."""
+    pytest_calls = [
+        tool_call
+        for tool_call in _find_tool_calls(st.session_state.messages, "run_pytest")
+        if str(tool_call["input"].get("target", "")).startswith(project_root)
+    ]
+    if not pytest_calls:
+        return False
+    return _parse_pytest_output(pytest_calls[-1]["output"])["exit_code"] == 0
+
+
+def _render_live_application_section() -> None:
+    """Once a generated Streamlit project's own tests have genuinely
+    passed, offer to launch/stop it as its own separate local server - via
+    tools.launch_generated_app/stop_generated_app called directly (never
+    through the agent), the same way the Changes page's Approve/Reject and
+    repair-counter-reset buttons already call workflow.py functions
+    directly. Never shown before that point, and the URL shown is always
+    read back from tools.get_generated_server's own tracked state - never
+    built from model output."""
+    project_root = _current_generated_project_root()
+    if not project_root or not _generated_project_tests_passed(project_root):
+        return
+
+    slug = project_root.rsplit("/", 1)[-1]
+    server = tools.get_generated_server(project_root)
+
+    st.write("")
+    with st.container(border=True):
+        st.markdown("#### 🚀 Live Application")
+        st.caption(f"Project: {html.escape(slug)}")
+
+        if server is None or server.status == "stopped":
+            st.markdown(
+                '<span class="pill neutral">Not running</span>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Start Live App", key=f"start_live_{slug}"):
+                with st.spinner("Starting the generated application..."):
+                    tools.launch_generated_app.invoke({"project_root": project_root})
+                st.rerun()
+        elif server.status == "running":
+            st.markdown(
+                '<span class="pill success">🟢 Running</span>',
+                unsafe_allow_html=True,
+            )
+            st.caption(f"URL: {server.url}")
+            open_col, stop_col = st.columns(2)
+            with open_col:
+                st.link_button("Open Live App", server.url, use_container_width=True)
+            with stop_col:
+                if st.button(
+                    "Stop App", key=f"stop_live_{slug}", use_container_width=True
+                ):
+                    tools.stop_generated_app.invoke({"project_root": project_root})
+                    st.rerun()
+        else:  # "failed"
+            st.markdown(
+                '<span class="pill error">Failed to start</span>',
+                unsafe_allow_html=True,
+            )
+            st.error(server.error or "The generated application could not be started.")
+            if st.button("Retry", key=f"retry_live_{slug}"):
+                with st.spinner("Starting the generated application..."):
+                    tools.launch_generated_app.invoke({"project_root": project_root})
+                st.rerun()
 
 
 def _request_nav_change(page: str) -> None:
@@ -948,12 +1195,18 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 api_key = get_api_key()
-if not api_key or api_key == "your_google_api_key_here":
+if not api_key or not api_key.strip() or api_key == "your_google_api_key_here":
     st.error(
         "⚠️ GOOGLE_API_KEY is not configured. Please add it to your .env file "
         "(see .env.example) and restart the app."
     )
     st.stop()
+if not api_key_looks_valid(api_key):
+    st.info(
+        "ℹ️ GOOGLE_API_KEY doesn't match the traditional 'AIza...' Gemini "
+        "key format, but continuing - Google's API will determine whether "
+        "it's actually valid."
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -1019,6 +1272,8 @@ def render_home_page() -> None:
                     f'<div class="task-step {status}">{icon} {html.escape(label)}</div>',
                     unsafe_allow_html=True,
                 )
+        _render_project_package_section(task)
+        _render_live_application_section()
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1312,8 @@ def render_chat_page() -> None:
                         f"{icon} {html.escape(label)}</div>",
                         unsafe_allow_html=True,
                     )
+        _render_project_package_section(task)
+        _render_live_application_section()
         st.write("")
 
     last_message_index = len(st.session_state.messages) - 1
@@ -1075,12 +1332,7 @@ def render_chat_page() -> None:
                     st.caption("🎤 Voice input · transcribed")
                 st.markdown(message["content"])
 
-    pending_changes = workflow.list_pending_changes()
-    if pending_changes:
-        st.info(
-            f"{len(pending_changes)} proposed change(s) are waiting for your review "
-            "on the **Changes** page."
-        )
+    _render_pending_changeset(agent)
 
     chat_value = st.chat_input(
         "Ask your developer assistant...",
@@ -1096,7 +1348,11 @@ def render_chat_page() -> None:
     if chat_value:
         newly_attached = False
         for uploaded in chat_value.files:
+            doc_started_at = time.time()
             processed = documents.process_upload(uploaded.name, uploaded.getvalue())
+            log_perf(
+                f"Document processing ({uploaded.name})", time.time() - doc_started_at
+            )
             if "error" in processed:
                 st.error(f"❌ {uploaded.name}: {processed['error']}")
             else:
@@ -1268,6 +1524,104 @@ def render_documents_page() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _render_change_detail(change: workflow.ProposedChange) -> None:
+    """Read-only detail block for one proposed change within a change set -
+    file path, action, risk level, purpose, change ID, and a diff/content
+    preview. No Approve/Reject control of its own: approval and apply are
+    always whole-change-set actions (see _render_pending_changeset) - never
+    rendered per file, so a task proposing several files never shows more
+    than one Approve button and one Apply button in total."""
+    risk_pill_class = {"low": "success", "medium": "warning", "high": "error"}.get(
+        change.risk, "warning"
+    )
+    st.markdown(
+        f"**{html.escape(change.file_path)}** &nbsp; "
+        f'<span class="pill neutral">{change.action.upper()}</span> &nbsp;'
+        f'<span class="pill {risk_pill_class}">Risk: {change.risk.title()}</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Purpose: {change.reason}")
+    st.caption(f"Change ID: `{change.change_id}`")
+
+    with st.expander("Review changes"):
+        if change.action == "modify":
+            safe_path = tools.PROJECT_ROOT / change.file_path
+            try:
+                old_text = safe_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                old_text = ""
+            diff_text = _unified_diff(old_text, change.content, change.file_path)
+            if diff_text.strip():
+                st.markdown(_diff_to_html(diff_text), unsafe_allow_html=True)
+            else:
+                st.caption("No textual difference detected.")
+        else:
+            st.caption("New file - full proposed content:")
+            st.code(change.content, language=_guess_language(change.file_path))
+
+
+def _render_pending_changeset(agent) -> None:
+    """Render the ONE current Phase 6 change set, if any, as a single
+    reviewable card - full detail for every proposed file, but exactly ONE
+    "Approve Changes" button for the whole set (never one button per file),
+    and, only once every member is approved, exactly ONE "Apply Approved
+    Changes" button. Shared by the Chat page (inline, right where the
+    proposal appeared) and the dedicated Changes page, so a proposal is
+    never reviewable in only one of the two places.
+
+    A change set stops being "current" (workflow.get_current_changeset_id()
+    returns None) the instant every one of its members has been applied -
+    at that point this renders nothing at all, so there is never a
+    lingering Approve/Apply control that could repeat an already-finished
+    action. Reject discards the whole set at once, the same way Approve
+    approves it - never per file.
+    """
+    changeset_id = workflow.get_current_changeset_id()
+    if changeset_id is None:
+        return
+
+    pending_view = [c for c in workflow.list_changeset(changeset_id) if not c.applied]
+    if not pending_view:
+        return
+    all_approved = all(c.approved for c in pending_view)
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="card-title">Proposed Changes</div>', unsafe_allow_html=True
+        )
+        for change in pending_view:
+            _render_change_detail(change)
+        st.caption(f"TOTAL: {len(pending_view)} change(s)")
+
+        if not all_approved:
+            approve_col, reject_col = st.columns(2)
+            with approve_col:
+                if st.button(
+                    "✅ Approve Changes",
+                    key=f"approve_set_{changeset_id}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    _approve_changeset(changeset_id)
+            with reject_col:
+                if st.button(
+                    "Reject Changes",
+                    key=f"reject_set_{changeset_id}",
+                    use_container_width=True,
+                ):
+                    workflow.reject_change_set(changeset_id)
+                    st.rerun()
+        else:
+            st.success(f"Changes approved ✅ — {len(pending_view)} change(s) approved.")
+            if st.button(
+                "🚀 Apply Approved Changes",
+                key=f"apply_set_{changeset_id}",
+                use_container_width=True,
+                type="primary",
+            ):
+                _apply_changeset_and_resume(agent, changeset_id)
+
+
 def render_changes_page() -> None:
     st.markdown(
         '<div class="page-title">Proposed Changes</div>', unsafe_allow_html=True
@@ -1287,87 +1641,7 @@ def render_changes_page() -> None:
             unsafe_allow_html=True,
         )
 
-    approved_via_button = None
-    for change in pending:
-        risk_pill_class = {"low": "success", "medium": "warning", "high": "error"}.get(
-            change.risk, "warning"
-        )
-        with st.container(border=True):
-            top_col, select_col = st.columns([5, 1])
-            with top_col:
-                st.markdown(
-                    f"**{html.escape(change.file_path)}** &nbsp; "
-                    f'<span class="pill neutral">{change.action.upper()}</span> &nbsp;'
-                    f'<span class="pill {risk_pill_class}">Risk: {change.risk.title()}</span>',
-                    unsafe_allow_html=True,
-                )
-            with select_col:
-                st.checkbox("Select", key=f"select_{change.change_id}")
-            st.caption(f"Purpose: {change.reason}")
-            st.caption(f"Change ID: `{change.change_id}`")
-
-            with st.expander("Review changes"):
-                if change.action == "modify":
-                    safe_path = tools.PROJECT_ROOT / change.file_path
-                    try:
-                        old_text = safe_path.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
-                        old_text = ""
-                    diff_text = _unified_diff(
-                        old_text, change.content, change.file_path
-                    )
-                    if diff_text.strip():
-                        st.markdown(_diff_to_html(diff_text), unsafe_allow_html=True)
-                    else:
-                        st.caption("No textual difference detected.")
-                else:
-                    st.caption("New file - full proposed content:")
-                    st.code(change.content, language=_guess_language(change.file_path))
-
-            approve_col, reject_col = st.columns(2)
-            with approve_col:
-                if st.button(
-                    "Approve",
-                    key=f"approve_{change.change_id}",
-                    use_container_width=True,
-                    type="primary",
-                ):
-                    approved_via_button = change
-            with reject_col:
-                if st.button(
-                    "Reject",
-                    key=f"reject_{change.change_id}",
-                    use_container_width=True,
-                ):
-                    workflow.reject_change(change.change_id)
-                    st.rerun()
-
-    if approved_via_button is not None:
-        _approve_and_resume(agent, approved_via_button)
-
-    if len(pending) > 1:
-        st.write("")
-        st.markdown(
-            '<div class="card-title">Batch actions</div>', unsafe_allow_html=True
-        )
-        st.caption(
-            "Batch actions only mark changes approved/rejected - they never "
-            "apply/write anything automatically. Approve one individually "
-            "(above) to have the assistant apply and test it immediately."
-        )
-        batch_approve_col, batch_reject_col = st.columns(2)
-        with batch_approve_col:
-            if st.button("Approve Selected", use_container_width=True):
-                for change in pending:
-                    if st.session_state.get(f"select_{change.change_id}"):
-                        workflow.approve_change(change.change_id)
-                st.rerun()
-        with batch_reject_col:
-            if st.button("Reject Selected", use_container_width=True):
-                for change in pending:
-                    if st.session_state.get(f"select_{change.change_id}"):
-                        workflow.reject_change(change.change_id)
-                st.rerun()
+    _render_pending_changeset(agent)
 
     stuck_files = [
         file_path

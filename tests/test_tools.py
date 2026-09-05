@@ -287,3 +287,40 @@ def test_search_project_empty_query():
 def test_search_project_skips_dot_env():
     result = search_project.invoke({"query": "GOOGLE_API_KEY"})
     assert ".env:" not in result
+
+
+def test_search_project_skips_excluded_directories():
+    """search_project's traversal prunes noise directories (venv, .git,
+    caches, ...) instead of walking into them and filtering after - this
+    proves that optimization never weakens the existing guarantee that
+    excluded-folder content is never surfaced, by planting a match inside
+    one and confirming it's still invisible to search."""
+    scratch_dir = PROJECT_ROOT / "__pycache__" / "_scratch_search_excluded_dir"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    scratch_file = scratch_dir / "scratch.py"
+    # Built via concatenation, like test_search_project_no_matches' needle
+    # above, so the literal string never appears in this test file itself -
+    # search_project would otherwise find this very source line.
+    needle = "ZZZ_UNIQUE_NEEDLE_" + "INSIDE_EXCLUDED_DIR_ZZZ"
+    scratch_file.write_text(f"# {needle}\n", encoding="utf-8")
+    try:
+        result = search_project.invoke({"query": needle})
+        assert "no matches found" in result.lower()
+    finally:
+        scratch_file.unlink()
+        scratch_dir.rmdir()
+
+
+def test_search_project_does_not_walk_the_entire_filesystem_tree():
+    """Performance regression guard: search_project must prune excluded
+    directories during the walk rather than listing every file under them
+    (e.g. venv/) and discarding most afterward. Measured on this project,
+    the old rglob("*")-then-filter approach took ~1.2s (walking ~22,000
+    entries under venv/); the pruning walk takes well under 1s."""
+    import time
+
+    started_at = time.time()
+    search_project.invoke({"query": "def run_ruff"})
+    elapsed = time.time() - started_at
+
+    assert elapsed < 1.0

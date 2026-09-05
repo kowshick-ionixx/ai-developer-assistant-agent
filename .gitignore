@@ -15,6 +15,20 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Generated project packages (Phase 6 create_project_zip / Download ZIP)
+dist/
+
+# generated_projects/ (New Application Generation, Phase 6) is deliberately
+# NOT ignored here - unlike dist/'s disposable build output, it holds the
+# actual generated application source code, which is real, human-approved
+# project content a user may want to track in their own repository.
+# Its own runtime artifacts are not source, though - a live-preview server's
+# stdout log and its small state file (used to reclaim/stop it even from a
+# fresh assistant process - see tools.py's launch_generated_app) - so those
+# are excluded the same way dist/ is.
+generated_projects/*/.server.log
+generated_projects/*/.server.state.json
+
 # Streamlit (secrets only - config.toml holds the app's theme, not secrets,
 # and is tracked so the dark dashboard theme ships with the project)
 .streamlit/*

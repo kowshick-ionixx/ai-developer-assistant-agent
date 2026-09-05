@@ -20,27 +20,43 @@ import base64
 import logging
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.exceptions import (
+    ModelAPIError,
+    ModelAuthenticationError,
+    ModelConnectionError,
+    ModelInvalidRequestError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+    ModelTimeoutError,
+)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from logger import (
     log_agent_start,
     log_approval_waiting,
+    log_error,
     log_final_response,
+    log_llm_call,
     log_llm_direct_response,
+    log_perf,
     log_request_start,
     log_tool_decision,
     log_user_input,
     log_workflow_state,
+    sanitize,
 )
 from tools import (
     apply_approved_change,
     calculator,
     check_python_syntax,
+    create_project_zip,
     documentation_search,
     explain_python_code,
     git_branch,
@@ -50,6 +66,7 @@ from tools import (
     github_get_issues,
     github_get_pull_requests,
     github_get_repository,
+    launch_generated_app,
     list_pending_changes,
     list_project_files,
     propose_file_change,
@@ -58,6 +75,7 @@ from tools import (
     run_pytest,
     run_ruff,
     search_project,
+    stop_generated_app,
     web_search,
 )
 from workflow import WorkflowStatus
@@ -98,7 +116,8 @@ list_project_files (structure) · read_project_file · search_project · calcula
 explain_python_code · run_pytest · run_ruff · run_black · check_python_syntax ·
 web_search · documentation_search · git_status · git_log · git_diff · git_branch ·
 github_get_repository · github_get_issues · github_get_pull_requests ·
-propose_file_change · apply_approved_change · list_pending_changes
+propose_file_change · apply_approved_change · list_pending_changes · create_project_zip ·
+launch_generated_app · stop_generated_app
 Use your own knowledge for generation/debugging/review/refactoring unless a tool is
 specifically needed. Never guess project files/functions/architecture/test results,
 current API/framework details, Git state, or GitHub data — verify with tools.
@@ -123,6 +142,13 @@ never let one keyword like "calculate", "number", "test", or "code" decide it al
   approved and applied, call run_pytest for real and report its real output. Never treat
   this phrase as permission to skip approval - "verify" means "run the real tool
   afterward and report truthfully," not "assume it works."
+- NEW APPLICATION: the user wants an entire new, standalone application built from a
+  requirement or an uploaded SRS - e.g. "Create a simple HRMS application in Python",
+  "Build a library book management API from the attached SRS". This is NOT the same as
+  DEVELOPMENT above (which edits THIS assistant's own project files) - follow
+  ## New Application Generation below instead, which still uses the exact same
+  propose_file_change -> approval -> apply_approved_change -> run_pytest flow, just
+  targeted at a new project folder and covering many files instead of one.
 
 A single request can combine several of these (e.g. "add X, test X, verify X" is
 DEVELOPMENT + TESTING + VERIFICATION end-to-end) - work through every part, don't stop
@@ -158,10 +184,12 @@ tools.py"), use read_project_file/search_project to inspect the real code, then 
 documentation as your answer — do not claim to have written it to a file.
 
 ## Execution, Testing & Error Analysis
-run_pytest runs this project's fixed test suite and returns the real exit code plus
-combined stdout/stderr (capped by a subprocess timeout - a timeout is reported as
-"took too long", never as success). check_python_syntax parses (never executes) one
-file, a folder, or the whole project ("." ) to find real SyntaxErrors.
+run_pytest with no argument runs THIS project's fixed test suite and returns the real
+exit code plus combined stdout/stderr (capped by a subprocess timeout - a timeout is
+reported as "took too long", never as success); pass target="generated_projects/<slug>/
+tests" ONLY when testing a project you generated under ## New Application Generation.
+check_python_syntax parses (never executes) one file, a folder, or the whole project
+("." ) to find real SyntaxErrors.
 
 - "Run my tests" / "run my tests and tell me how many passed and failed": call
   run_pytest and report the actual counts/output/exit code it returned - never invent
@@ -257,7 +285,24 @@ concisely - do not hide your steps, but do not narrate raw chain-of-thought eith
    never claim you can keep retrying past that point.
 6. Report: finish with a concise summary of what changed (files, by change_id), the
    actual final test/Ruff/Black results, and whether the task is complete - only ever
-   based on real tool output, never assumed.
+   based on real tool output, never assumed. State each check's real outcome
+   specifically, never a vague "completed"/"run" that hides what it actually found -
+   e.g. "Ruff: no issues found" vs "Ruff: 3 issues found (list them or name the file)",
+   "Black: already formatted" vs "Black: 1 file needs reformatting", "Tests: 12 passed"
+   vs "Tests: 2 failed (name them)". If a fix was actually applied and reverified, say
+   so explicitly (e.g. "Fixed: ..."). A check that found real issues must never be
+   reported as if it passed - passing and finding issues are different outcomes.
+7. Package (only after real completion): once the task is genuinely done - every needed
+   change approved and applied, and run_pytest's real output shows the full suite
+   passing - you may call create_project_zip to build a downloadable ZIP of the
+   project's current files (pass a short project_name if you have one, e.g. from the
+   task or an uploaded SRS's title). Never call it earlier "to save time", never in
+   place of running real tests, and never claim a package was created without actually
+   calling it and reporting its real result (files included/excluded, archive name).
+   The Streamlit UI also offers its own "Download Project ZIP" button once a task
+   reaches this same real completed state - you do not need to call this tool yourself
+   just because the user asks to "download the project"; it's fine to tell them the
+   button is available, or to call it yourself if they ask you to package it directly.
 
 Never fabricate a "verified"/"tests passed" outcome. If the user's request asked you to
 create and test something (e.g. "add X, create pytest tests for it, run the tests, and
@@ -279,6 +324,71 @@ skip the approval step.
 Git awareness: call git_status before starting a development task and git_diff after
 applying changes, and mention what actually changed - never call any Git command that
 writes (there is none available) and never claim to have committed or pushed anything.
+
+## New Application Generation (multi-file projects)
+A "NEW APPLICATION" request (see ## Request Classification) asks for a whole new,
+standalone application from a requirement or an uploaded SRS - e.g. "Create a simple HRMS
+application in Python", or a PDF-derived request to scaffold a project. This reuses the
+EXACT SAME propose_file_change -> WAIT FOR APPROVAL -> apply_approved_change -> run_pytest
+flow as ## Phase 6 above - there is no separate "generate a whole project" tool, and this
+never bypasses human approval, security checks, or testing for any of the reasons those
+exist. It differs from a normal Phase 6 task only in scope (many files, one new project)
+and in WHERE the files go.
+
+1. Requirement analysis: before proposing anything, state a short structured summary of
+   what you understood - project name, project type, language/framework, database (if
+   any), and the concrete features/requirements you'll build (e.g. "Employee registration,
+   attendance, leave management, dashboard"). If the request (or an attached SRS) leaves
+   something genuinely ambiguous (e.g. no database specified), say so explicitly and state
+   the reasonable default you're choosing (e.g. "no database specified - using SQLite")
+   rather than silently guessing a major architecture decision without saying so.
+2. Target folder: every file for a NEW APPLICATION goes under
+   "generated_projects/<slug>/" (slug = the project name, lowercase, spaces/punctuation
+   replaced with underscores - e.g. "generated_projects/hrms/app.py"). NEVER propose a
+   change to this assistant's own files (agent.py, app.py, tools.py, workflow.py, logger.py,
+   cli.py, documents.py, this project's own tests/, requirements.txt, README.md, etc.) as
+   part of a NEW APPLICATION request - those are only ever touched by a genuine DEVELOPMENT
+   request about this assistant itself. Design a project structure that actually fits the
+   requirement (files/folders like models, services, pages, utils, tests) - never force
+   every project into one fixed template regardless of what was actually asked for.
+3. Propose every file the design needs in this same turn - the generated app's own source
+   files, its own tests (reflecting the actual requirements, e.g. real employee/attendance/
+   leave tests for an HRMS, not meaningless placeholders), its own requirements.txt, and its
+   own README.md (purpose, install, env vars if any, how to run, how to test, project
+   structure - never with secret values in it). If the project has both source modules and
+   tests that import them (nearly always), ALSO propose an empty
+   "generated_projects/<slug>/conftest.py" - this is not optional decoration: without it,
+   pytest cannot import the generated project's own modules from its own tests/ folder (the
+   exact reason this assistant's own conftest.py exists - see conftest.py's own comment),
+   and run_pytest in step 4 below will fail with a real ModuleNotFoundError that has nothing
+   to do with the actual application logic. Call propose_file_change once per file, the
+   same as Phase 6 step 3 - never stop after only some of the files your own design
+   identified. Do not ask for approval until every file is proposed.
+4. Apply/test only after approval, same as Phase 6 step 4-5, with two differences: test the
+   GENERATED project's own suite with
+   run_pytest(target="generated_projects/<slug>/tests") - NOT a bare run_pytest() call,
+   which would run this assistant's own unrelated test suite instead - and check the
+   generated project specifically with run_ruff(file_path="generated_projects/<slug>") and
+   run_black(file_path="generated_projects/<slug>"). The same repair-attempt limit and
+   analyze/fix/retest loop from Phase 6 step 5 applies per generated file.
+5. Report/package: same as Phase 6 step 6-7 - a concise summary grounded in real tool
+   output, and, only once genuinely complete,
+   create_project_zip(source_dir="generated_projects/<slug>") to package JUST this
+   generated project (never a bare create_project_zip() call here - that would package
+   this whole assistant's own project instead of the generated one).
+6. Live preview (Streamlit projects only, only after real completion): once the generated
+   project's own tests genuinely pass (step 4), you may call
+   launch_generated_app(project_root="generated_projects/<slug>") to start it as its own
+   separate local server (never on this assistant's own port). This performs a REAL
+   localhost health check itself before reporting success - report exactly what it
+   returned (the real URL and port on success, or the real error on failure) and never
+   describe the app as "running" or give a URL unless this tool actually said so. If it
+   reports an error (e.g. no valid entry file, port unavailable, failed health check),
+   explain the real reason - never retry silently or claim success anyway. Call
+   stop_generated_app(project_root="generated_projects/<slug>") only if the user asks to
+   stop it; this never affects this assistant's own process. For a non-Streamlit generated
+   project (or if launch_generated_app reports it can't find a valid entry file), tell the
+   user how to run it themselves instead of claiming a live preview exists.
 
 ## Attached documents
 The user may attach document content (code, text, PDF/DOCX excerpts) as reference
@@ -330,6 +440,9 @@ TOOLS = [
     propose_file_change,
     apply_approved_change,
     list_pending_changes,
+    create_project_zip,
+    launch_generated_app,
+    stop_generated_app,
 ]
 
 
@@ -348,8 +461,16 @@ class _ToolDecisionLogger(BaseCallbackHandler):
     def __init__(self):
         self.decision_logged = False
         self.tool_used = False
+        self._llm_started_at: dict = {}
+        self._tool_started_at: dict = {}
 
-    def on_llm_end(self, response, **kwargs) -> None:
+    def on_llm_start(self, serialized, prompts, *, run_id, **kwargs) -> None:
+        self._llm_started_at[run_id] = time.time()
+
+    def on_llm_end(self, response, *, run_id=None, **kwargs) -> None:
+        started_at = self._llm_started_at.pop(run_id, None)
+        if started_at is not None:
+            log_perf("LLM call", time.time() - started_at)
         try:
             message = response.generations[0][0].message
         except (IndexError, AttributeError):
@@ -363,10 +484,283 @@ class _ToolDecisionLogger(BaseCallbackHandler):
             log_tool_decision(False)
             self.decision_logged = True
 
+    def on_tool_start(self, serialized, input_str, *, run_id, **kwargs) -> None:
+        self._tool_started_at[run_id] = (serialized.get("name", "tool"), time.time())
+
+    def on_tool_end(self, output, *, run_id=None, **kwargs) -> None:
+        entry = self._tool_started_at.pop(run_id, None)
+        if entry is not None:
+            name, started_at = entry
+            log_perf(f"Tool call ({name})", time.time() - started_at)
+
 
 def get_api_key() -> str | None:
     """Read the Gemini API key from the environment (loaded from .env)."""
     return os.getenv("GOOGLE_API_KEY")
+
+
+# Most Gemini API keys issued by Google AI Studio start with "AIza", but this
+# is not the only shape a working Google credential can take (Google has
+# accepted other prefixes, e.g. "AQ.", for credentials that authenticate
+# successfully against the real Gemini API). This check is therefore
+# advisory only - a hint for callers that want to flag an obviously
+# non-standard key shape - and must never be treated as proof a key is
+# invalid. Only a real call to Google's API can determine that; callers
+# should let ModelAuthenticationError (see describe_agent_error below)
+# be the actual source of truth for a rejected credential.
+_GOOGLE_API_KEY_FORMAT_RE = re.compile(r"^AIza[0-9A-Za-z_-]{20,}$")
+
+
+def api_key_looks_valid(key: str) -> bool:
+    """True if `key` has the shape of a traditional Google AI Studio Gemini
+    API key. Advisory only - False does NOT mean the key is invalid, only
+    that it doesn't match the traditional "AIza..." shape; other Google
+    credential shapes are known to work. Never reveals or logs the value
+    itself - callers only ever get True/False back."""
+    return bool(_GOOGLE_API_KEY_FORMAT_RE.match((key or "").strip()))
+
+
+# ---------------------------------------------------------------------------
+# LLM error classification and bounded retry - a real Gemini 429 must be
+# reported as a quota/rate-limit problem, never as "invalid API key" (a
+# working key that's merely out of quota is not an authentication failure).
+# This also separates a transient per-minute rate limit (worth a short,
+# bounded retry) from a daily quota that's genuinely exhausted (retrying
+# within seconds cannot help and would just add pointless extra requests) and
+# from a plain network problem (timeout/connection), which langchain_google_
+# genai does not classify on its own - see _classify_llm_exception below.
+# ---------------------------------------------------------------------------
+
+# Categories that mean "this exact same request might succeed if sent again
+# shortly" - anything else (bad credential, malformed request, unknown model,
+# a daily quota already at zero) will not be fixed by retrying, so retrying
+# it would only burn additional quota/time for no benefit.
+_RETRYABLE_LLM_CATEGORIES = frozenset(
+    {"rate_limit", "timeout", "connection", "server_error"}
+)
+
+MAX_LLM_RETRY_ATTEMPTS = 3
+_LLM_BACKOFF_BASE_SECONDS = 2.0
+_LLM_BACKOFF_MAX_SECONDS = 20.0
+
+
+def _extract_error_details(exc: Exception) -> dict | None:
+    """The raw parsed JSON error body from the underlying google-genai
+    ClientError/ServerError, if reachable. langchain_google_genai re-raises
+    Google's error as its own Model*Error subclass via `raise ... from e`
+    (see langchain_google_genai.chat_models._handle_client_error), so the
+    original exception - and its structured `.details` - is still available
+    via `__cause__`."""
+    cause = getattr(exc, "__cause__", None)
+    details = getattr(cause, "details", None)
+    if not isinstance(details, dict):
+        return None
+    return details
+
+
+def _error_detail_items(exc: Exception) -> list[dict]:
+    """The `error.details[]` list from a Google API error body (holds
+    structured entries like QuotaFailure/RetryInfo), if present."""
+    details = _extract_error_details(exc)
+    if details is None:
+        return []
+    items = details.get("details")
+    if items is None:
+        error = details.get("error")
+        if isinstance(error, dict):
+            items = error.get("details")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _retry_delay_seconds(exc: Exception) -> float | None:
+    """Google's own server-provided retry delay (a `RetryInfo.retryDelay`
+    value like "20s") from a 429/5xx response, if the API included one -
+    respecting this is more accurate than guessing a fixed backoff."""
+    for item in _error_detail_items(exc):
+        if "RetryInfo" not in str(item.get("@type", "")):
+            continue
+        retry_delay = item.get("retryDelay")
+        if isinstance(retry_delay, str) and retry_delay.endswith("s"):
+            try:
+                return float(retry_delay[:-1])
+            except ValueError:
+                return None
+    return None
+
+
+def _quota_violation_summary(exc: Exception) -> str | None:
+    """The specific Google quota metric/id a 429's `QuotaFailure` detail
+    named (e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier"), if the
+    API's error body included one - lets the user see exactly which quota
+    was hit instead of a generic "rate limited" message."""
+    for item in _error_detail_items(exc):
+        if "QuotaFailure" not in str(item.get("@type", "")):
+            continue
+        ids = [
+            v.get("quotaId") or v.get("quotaMetric")
+            for v in item.get("violations") or []
+            if isinstance(v, dict)
+        ]
+        ids = [i for i in ids if i]
+        if ids:
+            return ", ".join(ids)
+    return None
+
+
+def _classify_llm_exception(exc: Exception) -> str:
+    """Sort an exception raised by an LLM call into one of a fixed set of
+    categories: "invalid_credential", "invalid_request", "not_found",
+    "quota_exhausted" (a daily/longer-window cap - not worth retrying),
+    "rate_limit" (a short-window cap - worth a bounded retry),
+    "timeout", "connection", "server_error", or "other". Used by both
+    describe_agent_error() (user-facing message) and _invoke_with_retry()
+    (whether/how to retry) so the two stay consistent."""
+    if isinstance(exc, (ModelAuthenticationError, ModelPermissionDeniedError)):
+        return "invalid_credential"
+    if isinstance(exc, ModelInvalidRequestError):
+        return "invalid_request"
+    if isinstance(exc, ModelNotFoundError):
+        return "not_found"
+    if isinstance(exc, ModelTimeoutError):
+        return "timeout"
+    if isinstance(exc, ModelConnectionError):
+        return "connection"
+    if isinstance(exc, ModelRateLimitError):
+        quota_id = (_quota_violation_summary(exc) or "").lower()
+        text = f"{quota_id} {exc}".lower()
+        if "perday" in text.replace(" ", "") or "daily" in text:
+            return "quota_exhausted"
+        return "rate_limit"
+    if isinstance(exc, ModelAPIError):
+        return "server_error"
+    # Not a langchain Model*Error at all - most likely a raw network-layer
+    # failure (e.g. httpx/requests timeout or connection error) that
+    # langchain_google_genai only reclassifies for HTTP 4xx/5xx responses,
+    # not for the request never getting a response at all.
+    text = str(exc).lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "connection" in text:
+        return "connection"
+    return "other"
+
+
+def _invoke_with_retry(fn, *, purpose: str):
+    """Call `fn()` - a zero-argument callable that performs exactly one real
+    Gemini request - with bounded retry on transient failures only. Logs
+    safe, non-secret metadata for every attempt via logger.log_llm_call, so
+    the exact number of real HTTP requests behind one logical call is always
+    visible (this app never relies on the SDK's own hidden retries - see
+    _build_llm's max_retries=1 - specifically so this is the ONLY layer that
+    retries, with full visibility into every attempt).
+
+    Retries (up to MAX_LLM_RETRY_ATTEMPTS total attempts) only for
+    "rate_limit"/"timeout"/"connection"/"server_error" - a transient
+    condition that plausibly clears within seconds. Never retries a missing/
+    invalid credential, an invalid request, an unknown model, or a daily
+    quota already exhausted (see _classify_llm_exception) - none of those
+    can be fixed by simply trying again, so retrying would only waste time
+    and additional quota. Respects Google's own server-provided retry delay
+    when the error included one; otherwise backs off exponentially, capped.
+
+    Raises the final exception unchanged (for describe_agent_error() to turn
+    into a user-facing message) once attempts are exhausted or a
+    non-retryable category is hit.
+    """
+    model_name = get_model_name()
+    for attempt in range(1, MAX_LLM_RETRY_ATTEMPTS + 1):
+        started_at = time.time()
+        try:
+            result = fn()
+        except Exception as exc:  # classified below, then retried or re-raised
+            duration = time.time() - started_at
+            category = _classify_llm_exception(exc)
+            log_llm_call(
+                purpose=purpose,
+                model=model_name,
+                attempt=attempt,
+                duration=duration,
+                status="failure",
+                status_category=category,
+                detail=_quota_violation_summary(exc),
+            )
+            if (
+                category not in _RETRYABLE_LLM_CATEGORIES
+                or attempt == MAX_LLM_RETRY_ATTEMPTS
+            ):
+                raise
+            delay = _retry_delay_seconds(exc)
+            if delay is None:
+                delay = min(
+                    _LLM_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+                    _LLM_BACKOFF_MAX_SECONDS,
+                )
+            time.sleep(delay)
+            continue
+        duration = time.time() - started_at
+        log_llm_call(
+            purpose=purpose,
+            model=model_name,
+            attempt=attempt,
+            duration=duration,
+            status="success",
+        )
+        return result
+
+
+def describe_agent_error(exc: Exception) -> str:
+    """Turn an exception raised by run_agent_turn() into a short, accurate,
+    user-facing message - instead of app.py/cli.py always blaming the API
+    key regardless of what actually failed. Classification is delegated to
+    _classify_llm_exception() so this stays consistent with what
+    _invoke_with_retry() actually retried. Callers are still responsible for
+    logging the full exception for debugging."""
+    category = _classify_llm_exception(exc)
+    if category == "invalid_credential":
+        return (
+            "Your API key was rejected. Please check GOOGLE_API_KEY in your "
+            ".env file."
+        )
+    if category == "quota_exhausted":
+        quota_id = _quota_violation_summary(exc)
+        which = f" ({sanitize(quota_id)})" if quota_id else ""
+        return (
+            f"Your Gemini quota has been used up{which} - this looks like a "
+            "longer-window (e.g. daily) cap, not a brief rate limit. "
+            "Waiting a few seconds will not help; please wait for it to "
+            "reset, or use a plan/tier with a higher quota."
+        )
+    if category == "rate_limit":
+        return "Gemini rate limit reached. Please wait a moment and try again."
+    if category == "timeout":
+        return (
+            "The request to Gemini timed out. Please check your network "
+            "connection and try again."
+        )
+    if category == "connection":
+        return (
+            "Could not reach Gemini (network connection problem). Please "
+            "check your connection and try again."
+        )
+    if category == "not_found":
+        return (
+            "The configured model was not found. Please check GEMINI_MODEL "
+            "in your .env file."
+        )
+    if category == "invalid_request":
+        # Defense in depth: this is the one branch that surfaces the
+        # underlying exception's own text (Google's real "invalid request"
+        # response never echoes back the API key itself, but this is
+        # sanitized anyway rather than relying on that always holding true).
+        return f"The request was rejected as invalid: {sanitize(exc)}"
+    if category == "server_error":
+        return (
+            "Google's Gemini service is temporarily unavailable (high "
+            "demand). Please try again in a moment."
+        )
+    return "I couldn't process that request. Please check your API key or try again."
 
 
 DEFAULT_MODEL_NAME = "gemini-flash-lite-latest"
@@ -385,11 +779,16 @@ def _build_llm(temperature: float) -> ChatGoogleGenerativeAI:
 
     Shared by build_agent() (the full tool-using agent) and transcribe_audio()
     (a single plain completion call, no tools/agent loop) so both stay wired
-    to the same credentials and model name. Raises ValueError if no API key
-    is configured.
+    to the same credentials and model name. Raises ValueError only when no
+    API key is configured at all - the message names only the environment
+    variable, never the value. Whether a *configured* key actually works is
+    left entirely to Google's own API (a rejected key surfaces later as
+    ModelAuthenticationError, handled by describe_agent_error): a key's
+    shape not matching the traditional "AIza..." format is not treated as
+    proof it's invalid, since other working Google credential shapes exist.
     """
     api_key = get_api_key()
-    if not api_key or api_key == "your_google_api_key_here":
+    if not api_key or not api_key.strip() or api_key == "your_google_api_key_here":
         raise ValueError(
             "GOOGLE_API_KEY is not configured. Please add it to your .env file."
         )
@@ -398,6 +797,26 @@ def _build_llm(temperature: float) -> ChatGoogleGenerativeAI:
         model=get_model_name(),
         google_api_key=api_key,
         temperature=temperature,
+        # max_retries=1 (i.e. no retry) deliberately disables
+        # ChatGoogleGenerativeAI's own default of up to 6 silent, blind
+        # retries per request (it retries a 429 with a fixed backoff that
+        # ignores Google's own retry-after hint, and never logs the
+        # individual attempts) - a single logical LLM call could otherwise
+        # turn into up to 6 real billed requests before this app ever sees
+        # an error. _invoke_with_retry() below is this app's own, single,
+        # visible retry layer instead: bounded, quota-aware, and logged.
+        max_retries=1,
+        # "low" minimizes Gemini's internal "thinking"/reasoning pass before
+        # it answers - measured directly against the live API, the default
+        # thinking level turned even a trivial one-word classification call
+        # into a ~40s round trip (a hidden thoughtSignature was returned
+        # despite a 1-token answer). Every call this project makes - the
+        # tool-using agent's own turns included - is either a mechanical
+        # single-word/short-list output or a well-specified tool-selection
+        # step guided by a detailed system prompt, none of which need deep
+        # reasoning depth, so "low" cuts real latency without changing what
+        # any call is capable of deciding.
+        thinking_level="low",
     )
 
 
@@ -443,7 +862,9 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
             },
         ]
     )
-    response = llm.invoke([message])
+    response = _invoke_with_retry(
+        lambda: llm.invoke([message]), purpose="transcription"
+    )
     return _extract_text(response.content).strip()
 
 
@@ -471,7 +892,7 @@ def create_plan(user_task: str) -> list[str]:
     """
     llm = _build_llm(temperature=0.2)
     message = HumanMessage(content=f"{_PLANNER_INSTRUCTION}\n\nTask: {user_task}")
-    response = llm.invoke([message])
+    response = _invoke_with_retry(lambda: llm.invoke([message]), purpose="planner")
     text = _extract_text(response.content)
 
     steps = []
@@ -511,6 +932,9 @@ _TOOL_TO_WORKFLOW_STATUS = {
     "run_ruff": WorkflowStatus.TESTING,
     "run_black": WorkflowStatus.TESTING,
     "check_python_syntax": WorkflowStatus.TESTING,
+    "create_project_zip": WorkflowStatus.PACKAGING,
+    "launch_generated_app": WorkflowStatus.LIVE_PREVIEW,
+    "stop_generated_app": WorkflowStatus.LIVE_PREVIEW,
     # propose_file_change/apply_approved_change/run_pytest are handled
     # separately below - their workflow status depends on *when* in the
     # sequence (and, for run_pytest, on its own real pass/fail result) they
@@ -631,11 +1055,16 @@ def ask_agent(agent, conversation: list) -> dict:
     if isinstance(last_message, HumanMessage):
         log_user_input(_extract_text(last_message.content))
     log_agent_start()
+    turn_started_at = time.time()
 
     decision_logger = _ToolDecisionLogger()
-    result = agent.invoke(
-        {"messages": conversation}, config={"callbacks": [decision_logger]}
+    result = _invoke_with_retry(
+        lambda: agent.invoke(
+            {"messages": conversation}, config={"callbacks": [decision_logger]}
+        ),
+        purpose="agent_turn",
     )
+    log_perf("ask_agent (LLM + tool loop)", time.time() - turn_started_at)
     messages = result["messages"]
 
     # Match each ToolMessage (a tool's result) back to the AIMessage tool
@@ -767,7 +1196,9 @@ def classify_request(user_task: str) -> bool:
     """
     llm = _build_llm(temperature=0.0)
     message = HumanMessage(content=f"{_CLASSIFY_INSTRUCTION}\n\nRequest: {user_task}")
-    response = llm.invoke([message])
+    response = _invoke_with_retry(
+        lambda: llm.invoke([message]), purpose="classification"
+    )
     text = _extract_text(response.content).strip().upper()
     return text.startswith("DEVELOPMENT")
 
@@ -780,6 +1211,29 @@ def _latest_human_text(conversation: list) -> str | None:
 
 
 MAX_AUTO_CONTINUE_STEPS = 5
+
+# Tools whose call means the task actually moved forward this step - proposing/
+# applying a change, running the real test/lint/format suite, or packaging/
+# launching the finished result. Calling ONLY read-only inspection tools
+# (list_project_files, git_status, search_project, ...) is not forward
+# progress - a model with nothing left to do (e.g. asked NOT to modify project
+# files) can otherwise "look busy" by repeatedly re-inspecting the project,
+# which resets a naive "did any tool get called" idle counter and burns real
+# Gemini calls all the way to MAX_AUTO_CONTINUE_STEPS for no benefit. See the
+# consecutive_idle logic below - a step counts as idle unless one of these was
+# called, regardless of how many read-only tools were also called.
+_PROGRESS_TOOL_NAMES = frozenset(
+    {
+        "propose_file_change",
+        "apply_approved_change",
+        "run_pytest",
+        "run_ruff",
+        "run_black",
+        "create_project_zip",
+        "launch_generated_app",
+        "stop_generated_app",
+    }
+)
 
 _CONTINUE_NUDGE = (
     "Continue the task now - don't just restate your plan or findings in text. "
@@ -809,8 +1263,11 @@ def run_agent_turn(agent, conversation: list) -> dict:
     agent - via a plain follow-up message, never a second agent - to actually call its
     tools instead of describing what it would do next. Capped at
     MAX_AUTO_CONTINUE_STEPS attempts, with an earlier bail-out the moment two
-    consecutive attempts produce no tool call at all, so this can never loop forever
-    (mirrors the same "never infinite loop" principle as MAX_REPAIR_ATTEMPTS).
+    consecutive attempts make no real progress (see _PROGRESS_TOOL_NAMES - calling
+    only read-only inspection tools like list_project_files/git_status doesn't count,
+    so a model that's genuinely done can't "look busy" and burn every remaining
+    attempt), so this can never loop forever (mirrors the same "never infinite loop"
+    principle as MAX_REPAIR_ATTEMPTS).
 
     Non-development requests (calculations, conceptual questions, one-off code
     review/generation/debugging) are classified as such by classify_request() and
@@ -820,19 +1277,25 @@ def run_agent_turn(agent, conversation: list) -> dict:
     accumulated across every internal step, `answer` = the final step's text, and
     pending_change_ids/REVIEWING+COMPLETED/FAILED reflecting the overall outcome.
     """
+    turn_started_at = time.time()
     last_human = _latest_human_text(conversation)
     is_dev = False
     if last_human is not None:
         try:
             is_dev = classify_request(last_human)
-        except Exception:  # noqa: BLE001 - never let this pre-check break the chat
-            # If classification fails (e.g. a transient API error), the main
-            # agent call below will surface the same underlying problem on
-            # its own.
+        except Exception as exc:  # noqa: BLE001 - never break the chat
+            # Logged for diagnosability (a bug inside classify_request/
+            # _extract_text itself, unrelated to the API, would otherwise
+            # vanish with no trace anywhere) but never re-raised: the main
+            # agent call below will surface the same underlying problem
+            # (e.g. a transient API error) to the user on its own.
+            log_error("classify_request", exc)
             is_dev = False
 
     if not is_dev:
-        return ask_agent(agent, conversation)
+        result = ask_agent(agent, conversation)
+        log_perf("Total request (simple)", time.time() - turn_started_at)
+        return result
 
     log_workflow_state(WorkflowStatus.PLANNING.value)
 
@@ -851,7 +1314,10 @@ def run_agent_turn(agent, conversation: list) -> dict:
             break  # a legitimate pause point - waiting on human approval
 
         step_tool_calls = result.get("tool_calls") or []
-        consecutive_idle = 0 if step_tool_calls else consecutive_idle + 1
+        made_progress = any(
+            call.get("name") in _PROGRESS_TOOL_NAMES for call in step_tool_calls
+        )
+        consecutive_idle = 0 if made_progress else consecutive_idle + 1
         last_call = step_tool_calls[-1] if step_tool_calls else None
         last_test_passed = (
             last_call is not None
@@ -890,4 +1356,5 @@ def run_agent_turn(agent, conversation: list) -> dict:
 
     result["tool_calls"] = all_tool_calls
     result["workflow_states"] = all_workflow_states
+    log_perf("Total request (Phase 6 development task)", time.time() - turn_started_at)
     return result

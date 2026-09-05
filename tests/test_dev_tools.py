@@ -13,6 +13,7 @@ import workflow
 from tools import (
     PROJECT_ROOT,
     apply_approved_change,
+    apply_approved_change_set,
     list_pending_changes,
     propose_file_change,
 )
@@ -288,6 +289,113 @@ def test_full_propose_approve_apply_cycle_matches_registry_state(temp_project_fi
 
     assert workflow.get_change(change_id).applied is True
     assert change_id not in [c.change_id for c in workflow.list_pending_changes()]
+
+
+# ---------------------------------------------------------------------------
+# apply_approved_change_set: the deterministic, UI-triggered "apply the
+# whole approved change set exactly once" operation - never left to the AI
+# agent's own tool-calling judgment. Not a @tool: the agent cannot call this
+# itself.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_approved_change_set_writes_every_approved_member(temp_project_file):
+    other_file = "tests/_phase6_scratch_file_set_b.py"
+    try:
+        propose_a = propose_file_change.invoke(
+            {
+                "file_path": temp_project_file,
+                "new_content": "A = 1\n",
+                "reason": "t",
+            }
+        )
+        propose_b = propose_file_change.invoke(
+            {"file_path": other_file, "new_content": "B = 2\n", "reason": "t"}
+        )
+        change_id_a = _extract_change_id(propose_a)
+        change_id_b = _extract_change_id(propose_b)
+        changeset_id = workflow.get_change(change_id_a).changeset_id
+        assert workflow.get_change(change_id_b).changeset_id == changeset_id
+
+        workflow.approve_change_set(changeset_id)
+        outcome = apply_approved_change_set(changeset_id)
+
+        assert outcome["failed"] == []
+        assert {e["change_id"] for e in outcome["applied"]} == {
+            change_id_a,
+            change_id_b,
+        }
+        assert workflow.get_change(change_id_a).applied is True
+        assert workflow.get_change(change_id_b).applied is True
+        assert (PROJECT_ROOT / temp_project_file).read_text(encoding="utf-8") == (
+            "A = 1\n"
+        )
+        assert (PROJECT_ROOT / other_file).read_text(encoding="utf-8") == "B = 2\n"
+    finally:
+        other_path = PROJECT_ROOT / other_file
+        if other_path.exists():
+            other_path.unlink()
+
+
+def test_apply_approved_change_set_skips_unapproved_members(temp_project_file):
+    """A change set cannot be applied without going through approval first -
+    apply_approved_change_set must silently skip (never write) any member
+    that isn't approved, exactly like apply_approved_change refuses a single
+    unapproved change_id."""
+    propose_result = propose_file_change.invoke(
+        {"file_path": temp_project_file, "new_content": "x = 1\n", "reason": "t"}
+    )
+    change_id = _extract_change_id(propose_result)
+    changeset_id = workflow.get_change(change_id).changeset_id
+
+    outcome = apply_approved_change_set(changeset_id)
+
+    assert outcome == {"applied": [], "failed": []}
+    assert workflow.get_change(change_id).applied is False
+    assert not (PROJECT_ROOT / temp_project_file).exists()
+
+
+def test_apply_approved_change_set_unknown_id_applies_nothing():
+    assert apply_approved_change_set("does-not-exist") == {
+        "applied": [],
+        "failed": [],
+    }
+
+
+def test_apply_approved_change_set_is_idempotent(temp_project_file):
+    """Repeated apply does nothing: calling apply_approved_change_set again
+    after every member is already applied must not rewrite the file or
+    report anything newly applied."""
+    propose_result = propose_file_change.invoke(
+        {"file_path": temp_project_file, "new_content": "x = 1\n", "reason": "t"}
+    )
+    change_id = _extract_change_id(propose_result)
+    changeset_id = workflow.get_change(change_id).changeset_id
+    workflow.approve_change_set(changeset_id)
+
+    first = apply_approved_change_set(changeset_id)
+    assert [e["change_id"] for e in first["applied"]] == [change_id]
+
+    second = apply_approved_change_set(changeset_id)
+    assert second == {"applied": [], "failed": []}
+
+
+def test_apply_approved_change_set_reports_failures_without_crashing():
+    """A change that can't actually be written (e.g. a blocked path) must be
+    reported in "failed", not raise - and must never be silently treated as
+    if it had succeeded."""
+    change = workflow.register_change(
+        file_path=".env", action="modify", content="X=1", reason="bad"
+    )
+    workflow.approve_change_set(change.changeset_id)
+
+    outcome = apply_approved_change_set(change.changeset_id)
+
+    assert outcome["applied"] == []
+    assert len(outcome["failed"]) == 1
+    assert outcome["failed"][0]["change_id"] == change.change_id
+    assert "security" in outcome["failed"][0]["message"].lower()
+    assert workflow.get_change(change.change_id).applied is False
 
 
 # ---------------------------------------------------------------------------

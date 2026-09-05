@@ -11,14 +11,18 @@ from workflow import (
     WorkflowState,
     WorkflowStatus,
     approve_change,
+    approve_change_set,
     clear_all_changes,
     get_change,
+    get_current_changeset_id,
+    list_changeset,
     list_pending_changes,
     mark_applied,
     record_apply,
     record_test_outcome,
     register_change,
     reject_change,
+    reject_change_set,
     repair_attempts_for,
     repair_attempts_snapshot,
     repair_limit_reached,
@@ -180,6 +184,48 @@ def test_approve_change_returns_false_for_unknown_id():
     assert approve_change("does-not-exist") is False
 
 
+def test_approving_an_already_approved_change_is_a_safe_noop():
+    """Regression test for the duplicate-approval bug: a second approval
+    attempt on the same change_id (e.g. a duplicate click, or a Streamlit
+    rerun re-delivering the same click) must be ignored - it must not
+    re-announce or re-process the approval - while the change stays
+    approved exactly once."""
+    change = register_change("foo.py", "create", "x = 1\n", "demo")
+    assert approve_change(change.change_id) is True
+    assert approve_change(change.change_id) is False
+    assert approve_change(change.change_id) is False
+    assert get_change(change.change_id).approved is True
+
+
+def test_approving_an_already_applied_change_is_a_safe_noop():
+    change = register_change("foo.py", "create", "x = 1\n", "demo")
+    approve_change(change.change_id)
+    mark_applied(change.change_id)
+    assert approve_change(change.change_id) is False
+    assert get_change(change.change_id).applied is True
+
+
+def test_approving_two_different_changes_each_transitions_exactly_once():
+    change_a = register_change("a.py", "create", "a = 1\n", "demo a")
+    change_b = register_change("b.py", "create", "b = 2\n", "demo b")
+    assert approve_change(change_a.change_id) is True
+    assert approve_change(change_b.change_id) is True
+    assert approve_change(change_a.change_id) is False
+    assert approve_change(change_b.change_id) is False
+    assert get_change(change_a.change_id).approved is True
+    assert get_change(change_b.change_id).approved is True
+
+
+def test_unapproved_change_cannot_be_applied():
+    """apply_approved_change (tools.py) refuses anything not approved; this
+    confirms the registry-level invariant it relies on: a fresh change is
+    never approved by default, so it is never eligible to be treated as
+    applied without going through approve_change first."""
+    change = register_change("foo.py", "create", "x = 1\n", "demo")
+    assert change.approved is False
+    assert change.applied is False
+
+
 def test_reject_change_removes_it_from_registry():
     change = register_change("foo.py", "create", "x = 1\n", "demo")
     assert reject_change(change.change_id) is True
@@ -188,6 +234,17 @@ def test_reject_change_removes_it_from_registry():
 
 def test_reject_change_returns_false_for_unknown_id():
     assert reject_change("does-not-exist") is False
+
+
+def test_rejected_change_can_never_be_approved_or_applied():
+    """A rejected change is discarded outright, so it can never be
+    resurrected into an approved (and therefore applicable) state by a
+    later approve_change call for the same id."""
+    change = register_change("foo.py", "create", "x = 1\n", "demo")
+    change_id = change.change_id
+    assert reject_change(change_id) is True
+    assert approve_change(change_id) is False
+    assert get_change(change_id) is None
 
 
 def test_list_pending_changes_excludes_applied():
@@ -203,6 +260,91 @@ def test_clear_all_changes_empties_registry():
     register_change("a.py", "create", "a = 1\n", "demo")
     clear_all_changes()
     assert list_pending_changes() == []
+
+
+# ---------------------------------------------------------------------------
+# Change sets: every file proposed for one development task is grouped and
+# approved/rejected together as a single unit - never one at a time.
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_proposed_change_gets_its_own_changeset():
+    change = register_change("foo.py", "create", "x = 1\n", "demo")
+    assert change.changeset_id != ""
+    assert get_current_changeset_id() == change.changeset_id
+    assert list_changeset(change.changeset_id) == [change]
+
+
+def test_multiple_changes_proposed_before_approval_share_one_changeset():
+    change_a = register_change("a.py", "create", "a = 1\n", "demo a")
+    change_b = register_change("b.py", "create", "b = 2\n", "demo b")
+    assert change_a.changeset_id == change_b.changeset_id
+    assert get_current_changeset_id() == change_a.changeset_id
+    assert list_changeset(change_a.changeset_id) == [change_a, change_b]
+
+
+def test_a_new_changeset_starts_only_once_the_previous_one_is_fully_applied():
+    """A later change (e.g. a repair-loop fix proposed after a failing test
+    run) must NOT join an earlier changeset whose members are all already
+    applied - it needs its own fresh approval cycle."""
+    change_a = register_change("a.py", "create", "a = 1\n", "demo a")
+    mark_applied(change_a.change_id)
+    change_b = register_change("b.py", "create", "b = 2\n", "demo b")
+    assert change_b.changeset_id != change_a.changeset_id
+    assert get_current_changeset_id() == change_b.changeset_id
+
+
+def test_get_current_changeset_id_is_none_when_nothing_is_pending():
+    assert get_current_changeset_id() is None
+    change = register_change("a.py", "create", "a = 1\n", "demo")
+    mark_applied(change.change_id)
+    assert get_current_changeset_id() is None
+
+
+def test_approve_change_set_approves_every_member_at_once():
+    change_a = register_change("a.py", "create", "a = 1\n", "demo a")
+    change_b = register_change("b.py", "create", "b = 2\n", "demo b")
+
+    newly_approved = approve_change_set(change_a.changeset_id)
+
+    assert set(newly_approved) == {change_a.change_id, change_b.change_id}
+    assert get_change(change_a.change_id).approved is True
+    assert get_change(change_b.change_id).approved is True
+    # Approve never applies.
+    assert get_change(change_a.change_id).applied is False
+    assert get_change(change_b.change_id).applied is False
+
+
+def test_approve_change_set_is_idempotent():
+    """Repeated approval does nothing: calling approve_change_set again
+    after the whole set is already approved must approve nothing new."""
+    change = register_change("a.py", "create", "a = 1\n", "demo")
+    assert approve_change_set(change.changeset_id) == [change.change_id]
+    assert approve_change_set(change.changeset_id) == []
+    assert approve_change_set(change.changeset_id) == []
+    assert get_change(change.change_id).approved is True
+
+
+def test_approve_change_set_unknown_id_approves_nothing():
+    assert approve_change_set("does-not-exist") == []
+
+
+def test_reject_change_set_discards_every_member():
+    change_a = register_change("a.py", "create", "a = 1\n", "demo a")
+    change_b = register_change("b.py", "create", "b = 2\n", "demo b")
+
+    rejected = reject_change_set(change_a.changeset_id)
+
+    assert set(rejected) == {change_a.change_id, change_b.change_id}
+    assert get_change(change_a.change_id) is None
+    assert get_change(change_b.change_id) is None
+    assert get_current_changeset_id() is None
+
+
+def test_reject_change_set_is_idempotent():
+    change = register_change("a.py", "create", "a = 1\n", "demo")
+    assert reject_change_set(change.changeset_id) == [change.change_id]
+    assert reject_change_set(change.changeset_id) == []
 
 
 # ---------------------------------------------------------------------------
