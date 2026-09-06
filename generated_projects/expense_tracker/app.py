@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from datetime import datetime
 from database import ExpenseDatabase
 
@@ -10,83 +11,84 @@ def get_db():
 
 db = get_db()
 
-st.title("💰 Simple Expense Tracker")
+st.title("💰 Personal Expense Tracker")
 
-menu = ["Dashboard", "Add Expense", "Manage Expenses"]
-choice = st.sidebar.selectbox("Navigation", menu)
+# Sidebar navigation
+menu = st.sidebar.selectbox("Navigation", ["Dashboard", "Manage Expenses"])
 
-if choice == "Dashboard":
-    st.header("Dashboard & Summary")
+if menu == "Dashboard":
+    st.header("Financial Dashboard")
     
-    total = db.get_total_expense()
-    st.metric(label="Total Expenses", value=f"${total:,.2f}")
+    expenses = db.get_expenses()
     
-    st.subheader("Category Summary")
-    summary = db.get_category_summary()
-    if summary:
+    if not expenses:
+        st.info("No expenses recorded yet. Go to 'Manage Expenses' to add some!")
+    else:
+        df = pd.DataFrame(expenses)
+        df['amount'] = pd.to_numeric(df['amount'])
+        
+        total_spent = df['amount'].sum()
+        total_transactions = len(df)
+        
         col1, col2 = st.columns(2)
         with col1:
-            st.table([{"Category": row[0], "Total Amount ($)": f"{row[1]:,.2f}"} for row in summary])
+            st.metric("Total Expenses", f"${total_spent:,.2f}")
         with col2:
-            chart_data = {row[0]: row[1] for row in summary}
-            st.bar_chart(chart_data)
-    else:
-        st.info("No expenses recorded yet. Add some from the 'Add Expense' tab!")
+            st.metric("Total Transactions", total_transactions)
+            
+        st.subheader("Category-wise Spending")
+        category_totals = db.get_category_totals()
+        if category_totals:
+            cat_df = pd.DataFrame(category_totals)
+            cat_df.set_index('category', inplace=True)
+            st.bar_chart(cat_df['total'])
+            
+        st.subheader("Recent Transactions")
+        st.dataframe(df[['date', 'category', 'amount', 'description']].head(10), use_container_width=True)
 
-elif choice == "Add Expense":
-    st.header("Add New Expense")
+elif menu == "Manage Expenses":
+    st.header("Manage Expenses")
     
-    with st.form("add_expense_form"):
-        categories = ["Food", "Housing", "Transport", "Utilities", "Entertainment", "Healthcare", "Other"]
-        category = st.selectbox("Category", categories)
-        amount = st.number_input("Amount ($)", min_value=0.01, step=1.00, format="%.2f")
+    with st.form("expense_form", clear_on_submit=True):
+        st.subheader("Add New Expense")
+        amount = st.number_input("Amount ($)", min_value=0.01, format="%.2f")
+        category = st.selectbox("Category", ["Food", "Transport", "Housing", "Utilities", "Entertainment", "Other"])
         date = st.date_input("Date", value=datetime.today())
-        description = st.text_input("Description (Optional)")
+        description = st.text_input("Description")
         
         submitted = st.form_submit_button("Add Expense")
         if submitted:
-            try:
-                db.add_expense(category, amount, date.strftime("%Y-%m-%d"), description)
+            if amount > 0:
+                db.add_expense(amount, category, str(date), description)
                 st.success("Expense added successfully!")
-            except ValueError as e:
-                st.error(f"Error: {e}")
-
-elif choice == "Manage Expenses":
-    st.header("View, Edit & Delete Expenses")
-    
+                st.rerun()
+            else:
+                st.error("Amount must be greater than zero.")
+                
+    st.subheader("Existing Expenses")
     expenses = db.get_expenses()
-    if not expenses:
-        st.info("No expenses found.")
-    else:
+    
+    if expenses:
         for exp in expenses:
-            exp_id, cat, amt, dt, desc = exp
-            with st.expander(f"{dt} | {cat} | ${amt:,.2f} {f'- {desc}' if desc else ''}"):
-                with st.form(f"edit_form_{exp_id}"):
-                    categories = ["Food", "Housing", "Transport", "Utilities", "Entertainment", "Healthcare", "Other"]
-                    new_cat = st.selectbox("Category", categories, index=categories.index(cat) if cat in categories else 0)
-                    new_amt = st.number_input("Amount ($)", min_value=0.01, value=float(amt), step=1.00, format="%.2f", key=f"amt_{exp_id}")
-                    try:
-                        default_date = datetime.strptime(dt, "%Y-%m-%d").date()
-                    except ValueError:
-                        default_date = datetime.today().date()
-                    new_dt = st.date_input("Date", value=default_date, key=f"dt_{exp_id}")
-                    new_desc = st.text_input("Description", value=desc, key=f"desc_{exp_id}")
+            with st.expander(f"{exp['date']} | {exp['category']} | ${exp['amount']:.2f} - {exp['description'] or 'No description'}"):
+                with st.form(f"edit_form_{exp['id']}"):
+                    new_amount = st.number_input("Amount ($)", min_value=0.01, value=float(exp['amount']), format="%.2f", key=f"amt_{exp['id']}")
+                    categories = ["Food", "Transport", "Housing", "Utilities", "Entertainment", "Other"]
+                    default_cat_idx = categories.index(exp['category']) if exp['category'] in categories else 0
+                    new_category = st.selectbox("Category", categories, index=default_cat_idx, key=f"cat_{exp['id']}")
+                    new_date = st.date_input("Date", value=datetime.strptime(exp['date'], "%Y-%m-%d").date(), key=f"date_{exp['id']}")
+                    new_desc = st.text_input("Description", value=exp['description'] or "", key=f"desc_{exp['id']}")
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        update_submitted = st.form_submit_button("Update Expense")
-                    with col2:
-                        delete_submitted = st.form_submit_button("Delete Expense")
-                        
-                    if update_submitted:
-                        try:
-                            db.update_expense(exp_id, new_cat, new_amt, new_dt.strftime("%Y-%m-%d"), new_desc)
-                            st.success("Expense updated successfully!")
+                    col_save, col_del = st.columns(2)
+                    with col_save:
+                        if st.form_submit_button("Save Changes"):
+                            db.update_expense(exp['id'], new_amount, new_category, str(new_date), new_desc)
+                            st.success("Expense updated!")
                             st.rerun()
-                        except ValueError as e:
-                            st.error(f"Error: {e}")
-                    
-                    if delete_submitted:
-                        db.delete_expense(exp_id)
-                        st.success("Expense deleted successfully!")
-                        st.rerun()
+                    with col_del:
+                        if st.form_submit_button("Delete"):
+                            db.delete_expense(exp['id'])
+                            st.success("Expense deleted!")
+                            st.rerun()
+    else:
+        st.info("No expenses found.")

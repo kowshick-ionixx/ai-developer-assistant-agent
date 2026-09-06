@@ -273,7 +273,13 @@ from workflow import repair_attempts_for as _repair_attempts_for
 from workflow import repair_limit_reached as _repair_limit_reached
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-_SUBPROCESS_TIMEOUT_SECONDS = 60
+# run_pytest's own subprocess timeout. Must comfortably exceed how long this
+# assistant's own "tests/" suite actually takes to run (measured live at
+# ~112s for the current suite with run_pytest's own "-v --no-header" flags -
+# a bare 60s cutoff was confirmed to make run_pytest() falsely report "took
+# too long" on a fully-passing suite), with headroom for the suite to keep
+# growing and for slower CI/host machines.
+_SUBPROCESS_TIMEOUT_SECONDS = 240
 
 # Folders that are noise (virtual env, VCS metadata, tool/dependency caches)
 # rather than actual project source - excluded from listings, file reads,
@@ -1983,6 +1989,17 @@ def apply_approved_change(change_id: str) -> str:
         )
         log_tool_result(result)
         return result
+    if change.applied:
+        # Same idempotency guarantee apply_approved_change_set already gives
+        # the UI's "Apply" button (see its own "already applied" skip) -
+        # without this, a stale/duplicate agent tool call for a change_id
+        # that was already written would silently re-write the file again
+        # AND re-increment workflow.py's repair-attempt tally for that file,
+        # eventually tripping the repair-attempt circuit breaker from
+        # nothing but redundant re-applies of one already-successful fix.
+        result = f"Change '{change_id}' was already applied - nothing to do."
+        log_tool_result(result)
+        return result
 
     result = _write_approved_change_to_disk(change)
     log_tool_result(result)
@@ -2066,6 +2083,7 @@ _ZIP_EXTRA_EXCLUDED_DIR_NAMES = _EXCLUDED_DIR_NAMES | {_ZIP_OUTPUT_DIRNAME}
 _ZIP_SECRET_SCAN_MAX_BYTES = _MAX_FILE_READ_BYTES
 _ZIP_NAME_RE = re.compile(r"[^a-z0-9]+")
 
+
 # Idempotency cache (see create_project_zip's docstring): process-wide and
 # single-user, the same pattern as workflow.py's pending-change registry -
 # this project runs as one local, single-user app/CLI, not a multi-tenant
@@ -2130,7 +2148,10 @@ def _scan_project_files(root: Path) -> dict:
     redaction actually works - scanning them would silently exclude real,
     load-bearing test files from the package on every build. Name-based
     exclusion (_is_blocked_file: .env, credential/password/secret-named
-    files, key/cert extensions) still applies everywhere, including tests/.
+    files, key/cert extensions) still applies everywhere, including tests/ -
+    as does excluding a launched generated-project preview server's own
+    runtime artifacts (_SERVER_LOG_FILENAME/_SERVER_STATE_FILENAME - see
+    launch_generated_app), which are process state/output, never source.
     """
     included: list[Path] = []
     excluded: list[str] = []
@@ -2143,6 +2164,9 @@ def _scan_project_files(root: Path) -> dict:
             path = Path(dirpath) / filename
             rel = path.relative_to(root).as_posix()
             if path.suffix.lower() == ".zip":
+                excluded.append(rel)
+                continue
+            if filename in (_SERVER_LOG_FILENAME, _SERVER_STATE_FILENAME):
                 excluded.append(rel)
                 continue
             if _is_blocked_file(path):

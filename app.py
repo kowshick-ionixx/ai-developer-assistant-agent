@@ -31,7 +31,6 @@ import tools
 import workflow
 from agent import (
     AGENT_TEMPERATURE,
-    api_key_looks_valid,
     build_agent,
     describe_agent_error,
     get_api_key,
@@ -1201,12 +1200,12 @@ if not api_key or not api_key.strip() or api_key == "your_google_api_key_here":
         "(see .env.example) and restart the app."
     )
     st.stop()
-if not api_key_looks_valid(api_key):
-    st.info(
-        "ℹ️ GOOGLE_API_KEY doesn't match the traditional 'AIza...' Gemini "
-        "key format, but continuing - Google's API will determine whether "
-        "it's actually valid."
-    )
+# Deliberately no UI warning for a key that merely doesn't match the
+# traditional "AIza..." shape (api_key_looks_valid is advisory only - see
+# its own docstring) - other real Google credential shapes are known to
+# work, and only an actual rejection from Google's API (surfaced below via
+# build_agent()'s own exception handling) should ever tell the user
+# something is wrong with their key.
 
 
 @st.cache_resource(show_spinner=False)

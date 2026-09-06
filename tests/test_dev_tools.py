@@ -242,6 +242,44 @@ def test_apply_approved_change_writes_file_once_approved(temp_project_file):
     assert written_path.read_text(encoding="utf-8") == "VALUE = 42\n"
 
 
+def test_apply_approved_change_is_idempotent_for_a_single_already_applied_change(
+    temp_project_file,
+):
+    """Regression test for a real, live-reproduced bug: calling
+    apply_approved_change again for a change_id that was already written
+    (e.g. a stale/duplicate agent tool call, or a Streamlit rerun) must be a
+    safe no-op - it must NOT re-write the file a second time, and it must
+    NOT re-increment workflow.py's repair-attempt tally for that file
+    (confirmed live: two redundant re-applies of one already-successful
+    change_id, with no new failure in between, used to silently count
+    toward the same repair-attempt limit as two genuinely distinct repair
+    cycles). apply_approved_change_set already got this right (see its own
+    "already applied" skip) - this is the same guarantee for the single-
+    change tool the AI agent itself calls."""
+    propose_result = propose_file_change.invoke(
+        {
+            "file_path": temp_project_file,
+            "new_content": "VALUE = 42\n",
+            "reason": "t",
+        }
+    )
+    change_id = _extract_change_id(propose_result)
+    workflow.approve_change(change_id)
+
+    first = apply_approved_change.invoke({"change_id": change_id})
+    assert "applied change" in first.lower()
+    assert workflow.repair_attempts_for(temp_project_file) == 1
+
+    second = apply_approved_change.invoke({"change_id": change_id})
+    assert "already applied" in second.lower()
+    assert "error" not in second.lower()
+    # Must not have counted as a second repair attempt on this file.
+    assert workflow.repair_attempts_for(temp_project_file) == 1
+
+    written_path = PROJECT_ROOT / temp_project_file
+    assert written_path.read_text(encoding="utf-8") == "VALUE = 42\n"
+
+
 def test_apply_approved_change_unknown_id_is_an_error():
     result = apply_approved_change.invoke({"change_id": "not-a-real-id"})
     assert "no pending change found" in result.lower()

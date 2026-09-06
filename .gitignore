@@ -28,6 +28,7 @@ dist/
 # are excluded the same way dist/ is.
 generated_projects/*/.server.log
 generated_projects/*/.server.state.json
+generated_projects/*/*.db
 
 # Streamlit (secrets only - config.toml holds the app's theme, not secrets,
 # and is tracked so the dark dashboard theme ships with the project)

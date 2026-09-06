@@ -371,6 +371,30 @@ def test_generated_project_zip_contains_only_that_projects_files(
     assert all(f.startswith("_scratch_app/") for f in package["files"])
 
 
+def test_generated_project_zip_excludes_launched_server_runtime_files(
+    scratch_generated_project,
+):
+    """A previously-launched live-preview server (see launch_generated_app)
+    leaves its own runtime artifacts - a stdout log and a small process-
+    state file - next to the generated project. Neither is source the user
+    wrote; both must be excluded from the downloadable archive the same way
+    the project's own .gitignore already excludes them from version
+    control (regression test for the real, live-verified bug where these
+    two files were being packaged)."""
+    (scratch_generated_project / ".server.log").write_text("server started\n")
+    (scratch_generated_project / ".server.state.json").write_text(
+        '{"pid": 1234, "port": 8600}\n'
+    )
+
+    package = get_or_build_generated_project_zip(
+        source_dir="generated_projects/_scratch_app", force=True
+    )
+
+    assert "_scratch_app/.server.log" not in package["files"]
+    assert "_scratch_app/.server.state.json" not in package["files"]
+    assert package["included"] == 3
+
+
 def test_generated_project_zip_top_level_entry_matches_folder_name(
     scratch_generated_project,
 ):

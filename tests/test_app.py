@@ -97,11 +97,14 @@ _FAKE_INVALID_FORMAT_KEY = "AQ.FakeNonGeminiTokenForTestingOnly1234567890"
 
 def _rendered_ui_text(at) -> str:
     """Every bit of text this run actually rendered - markdown, errors,
-    captions - concatenated, to search for an accidental secret leak."""
+    captions, info notices - concatenated, to search for an accidental
+    secret leak (or, for other tests, confirm a specific notice is/isn't
+    shown)."""
     return "\n".join(
         [m.value for m in at.markdown]
         + [e.value for e in at.error]
         + [c.value for c in at.caption]
+        + [i.value for i in at.info]
     )
 
 
@@ -126,13 +129,20 @@ def test_differently_shaped_api_key_does_not_block_the_app(monkeypatch):
     shape (e.g. a working 'AQ.'-prefixed key, seen in a real support case)
     must not be hard-rejected locally - the app must load normally instead
     of stopping on the old format error, leaving it to Google's own API to
-    determine whether the credential actually works."""
+    determine whether the credential actually works. It also must not show
+    ANY format-mismatch message in the UI (regression test: the app used to
+    show an "doesn't match the traditional 'AIza...' Gemini key format"
+    st.info() notice here - api_key_looks_valid is advisory-only, so the UI
+    must stay silent about format and let a real API rejection, not a local
+    guess, be the only thing that ever tells the user their key is wrong)."""
     monkeypatch.setenv("GOOGLE_API_KEY", _FAKE_INVALID_FORMAT_KEY)
     at = AppTest.from_file(_APP_PATH)
     at.run(timeout=30)
     assert at.exception == []
     rendered = _rendered_ui_text(at)
     assert "does not look like a valid gemini api key" not in rendered.lower()
+    assert "doesn't match the traditional" not in rendered.lower()
+    assert "aiza" not in rendered.lower()
     # The actual (fake, but still "the configured value") key must never
     # appear anywhere in the rendered page.
     assert _FAKE_INVALID_FORMAT_KEY not in rendered
@@ -1143,6 +1153,59 @@ def test_download_button_appears_once_workflow_genuinely_completes(
     assert len(download_buttons) == 1
     markdown_text = "\n".join(m.value for m in at.markdown)
     assert "Project Completed" in markdown_text
+
+
+def test_download_button_serves_the_real_valid_archive_from_disk(
+    apptest_with_mocked_agent, monkeypatch
+):
+    """Regression coverage for the actual download mechanism, not just the
+    button's presence: the exact bytes the button hands to
+    st.download_button must be the same archive get_or_build_project_zip
+    just wrote to dist/, must open cleanly with Python's own zipfile
+    module, and must never contain '.env', '.git', a venv, __pycache__, or
+    a previously generated archive."""
+    import zipfile
+
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+    import tools
+
+    _set_completed_workflow(agent_module, monkeypatch, tests_passed=True)
+
+    captured: dict = {}
+    real_get_or_build = tools.get_or_build_project_zip
+
+    def capturing_get_or_build(*args, **kwargs):
+        package = real_get_or_build(*args, **kwargs)
+        captured["package"] = package
+        return package
+
+    monkeypatch.setattr(tools, "get_or_build_project_zip", capturing_get_or_build)
+
+    at.chat_input[0].set_value("Add a feature").run(timeout=30)
+    at.run(timeout=30)
+    assert at.exception == []
+
+    download_buttons = [
+        b for b in at.download_button if b.key == "download_project_zip"
+    ]
+    assert len(download_buttons) == 1
+    assert "package" in captured
+
+    on_disk = tools.PROJECT_ROOT / "dist" / captured["package"]["filename"]
+    assert on_disk.is_file()
+    on_disk_bytes = on_disk.read_bytes()
+    assert on_disk_bytes == captured["package"]["bytes"]
+
+    with zipfile.ZipFile(on_disk) as zf:
+        assert zf.testzip() is None  # every member's CRC actually checks out
+        names = [n.lower() for n in zf.namelist()]
+
+    assert not any(n == ".env" or n.endswith("/.env") for n in names)
+    assert not any(n.startswith(".git/") for n in names)
+    assert not any(n.startswith("venv/") or "/venv/" in n for n in names)
+    assert not any("__pycache__" in n for n in names)
+    assert not any(n.endswith(".zip") for n in names)
 
 
 def test_repeated_rerun_after_completion_does_not_rebuild_the_archive(
