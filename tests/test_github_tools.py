@@ -195,6 +195,21 @@ def test_github_get_issues_not_found(monkeypatch):
     assert "not found" in result.lower()
 
 
+def test_github_get_issues_handles_unexpected_exception(monkeypatch):
+    """A tool exception that isn't PyGithub's own GithubException (e.g. a raw
+    network-layer failure) must still be reported cleanly rather than
+    crashing the agent turn - matching github_get_repository's generic
+    except-Exception coverage."""
+
+    class _BoomClient:
+        def get_repo(self, name):
+            raise ConnectionError("simulated network failure")
+
+    _use_client(monkeypatch, _BoomClient())
+    result = github_get_issues.invoke({"repo_full_name": "octocat/hello-world"})
+    assert "error" in result.lower()
+
+
 # ---------------------------------------------------------------------------
 # github_get_pull_requests
 # ---------------------------------------------------------------------------
@@ -222,6 +237,16 @@ def test_github_get_pull_requests_requires_repo_name(monkeypatch):
     monkeypatch.delenv("GITHUB_REPO", raising=False)
     result = github_get_pull_requests.invoke({"repo_full_name": ""})
     assert "no repository specified" in result.lower()
+
+
+def test_github_get_pull_requests_handles_unexpected_exception(monkeypatch):
+    class _BoomClient:
+        def get_repo(self, name):
+            raise ConnectionError("simulated network failure")
+
+    _use_client(monkeypatch, _BoomClient())
+    result = github_get_pull_requests.invoke({"repo_full_name": "octocat/hello-world"})
+    assert "error" in result.lower()
 
 
 # ---------------------------------------------------------------------------

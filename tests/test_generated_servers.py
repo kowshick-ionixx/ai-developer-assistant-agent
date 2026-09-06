@@ -210,6 +210,28 @@ def test_launch_reports_running_after_a_real_health_check_passes(
     assert server.entry_file == "app.py"
 
 
+def test_launch_handles_popen_oserror_without_crashing(
+    scratch_app_project, monkeypatch
+):
+    """Tool exception coverage: if the OS itself refuses to start the
+    subprocess (e.g. streamlit isn't actually installed), Popen raises
+    OSError - this must be reported as a clean error, never an unhandled
+    crash of the tool (and therefore of the agent turn)."""
+    project_root, _root = scratch_app_project
+
+    def fake_popen(args, **kwargs):
+        raise OSError("streamlit executable not found")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tools, "_select_safe_port", lambda: 8502)
+
+    result = launch_generated_app.invoke({"project_root": project_root})
+
+    assert "error" in result.lower()
+    assert "could not start the generated application" in result.lower()
+    assert "streamlit executable not found" in result
+
+
 def test_launch_writes_a_log_file_inside_the_generated_project(
     scratch_app_project, monkeypatch
 ):

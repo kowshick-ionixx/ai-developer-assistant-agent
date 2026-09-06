@@ -9,7 +9,9 @@ need a real `git` executable or a real repository on disk.
 
 import datetime
 
+import pytest
 from git.exc import GitCommandError
+from pydantic import ValidationError
 
 import tools
 from tools import git_branch, git_diff, git_log, git_status
@@ -187,6 +189,19 @@ def test_git_log_clamps_out_of_range_max_count(monkeypatch):
     _use_repo(monkeypatch, repo)
     git_log.invoke({"max_count": 0})
     assert repo.iter_commits_calls == [1]
+
+
+def test_git_log_rejects_non_numeric_max_count():
+    """An incorrect argument type - a string that can't parse as an int -
+    is rejected by LangChain's pydantic args schema before git_log's own
+    body (and its defensive try/except int() cast) ever runs."""
+    with pytest.raises(ValidationError):
+        git_log.invoke({"max_count": "not-a-number"})
+
+
+def test_git_log_rejects_fractional_max_count():
+    with pytest.raises(ValidationError):
+        git_log.invoke({"max_count": 3.7})
 
 
 # ---------------------------------------------------------------------------

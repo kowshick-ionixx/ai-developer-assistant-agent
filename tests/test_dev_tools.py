@@ -8,6 +8,7 @@ any file created during a test is cleaned up afterward.
 """
 
 import pytest
+from pydantic import ValidationError
 
 import workflow
 from tools import (
@@ -50,6 +51,20 @@ def _extract_change_id(propose_result: str) -> str:
 # ---------------------------------------------------------------------------
 # propose_file_change: never writes, validates path safety
 # ---------------------------------------------------------------------------
+
+
+def test_propose_file_change_missing_required_arguments_raises_validation_error():
+    """A tool call missing required arguments (new_content, reason) never
+    reaches propose_file_change's own body - LangChain's pydantic-derived
+    args schema rejects it first, so a change can never be registered from
+    an incomplete call."""
+    with pytest.raises(ValidationError):
+        propose_file_change.invoke({"file_path": "x.py"})
+
+
+def test_apply_approved_change_missing_change_id_raises_validation_error():
+    with pytest.raises(ValidationError):
+        apply_approved_change.invoke({})
 
 
 def test_propose_file_change_does_not_write_to_disk(temp_project_file):

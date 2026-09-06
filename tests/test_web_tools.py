@@ -109,6 +109,24 @@ def test_web_search_handles_api_failure(monkeypatch):
     assert "search failed" in result.lower()
 
 
+def test_web_search_handles_malformed_non_dict_response(monkeypatch):
+    """Malformed tool output from an external dependency: Tavily's SDK is
+    expected to return a dict, but _tavily_search only trusts that via
+    isinstance(response, dict) - a response shaped differently (e.g. a bare
+    list, or None) must degrade to "no results" instead of raising."""
+
+    class _MalformedTavilyClient:
+        def __init__(self, api_key):
+            pass
+
+        def search(self, **kwargs):
+            return ["not", "a", "dict"]
+
+    monkeypatch.setattr(tools, "TavilyClient", _MalformedTavilyClient)
+    result = web_search.invoke({"query": "python"})
+    assert "no results found" in result.lower()
+
+
 def test_web_search_never_leaks_api_key(monkeypatch):
     monkeypatch.setattr(tools, "TavilyClient", _FakeTavilyClient)
     result = web_search.invoke({"query": "python"})

@@ -4,8 +4,15 @@ Tests for tools.py.
 These exercise the tools directly (via .invoke(...), the same way LangChain
 calls them) without needing the Gemini API - the calculator and code
 explainer are pure Python, and run_ruff/run_black only shell out to the
-already-installed ruff/black executables.
+already-installed ruff/black executables (except where noted, where
+subprocess.run is mocked to exercise the timeout/OSError branches that a real
+ruff/black invocation would never hit).
 """
+
+import subprocess
+
+import pytest
+from pydantic import ValidationError
 
 from tools import (
     PROJECT_ROOT,
@@ -42,9 +49,42 @@ def test_calculator_rejects_unsafe_input():
     assert "error" in result.lower()
 
 
+def test_calculator_rejects_further_injection_shapes():
+    """Regression/breadth coverage for malicious input beyond the one
+    __import__ case: _safe_eval_node only ever accepts Constant/BinOp/UnaryOp
+    AST nodes, so any expression involving attribute access, a function call,
+    or a builtin name should be rejected the same way - never executed."""
+    for expression in (
+        "os.system('dir')",
+        "().__class__",
+        "exec('x = 1')",
+        "open('tools.py').read()",
+    ):
+        result = calculator.invoke({"expression": expression})
+        assert "error" in result.lower(), f"expected rejection for: {expression}"
+
+
 def test_calculator_empty_expression():
     result = calculator.invoke({"expression": "   "})
     assert "error" in result.lower()
+
+
+def test_calculator_missing_expression_raises_validation_error():
+    """A tool call missing a required argument entirely (as opposed to
+    passing an empty string) never reaches calculator's own body - LangChain's
+    pydantic-derived args schema rejects it first."""
+    with pytest.raises(ValidationError):
+        calculator.invoke({})
+
+
+def test_calculator_rejects_non_string_expression_type():
+    """An incorrect argument type (e.g. a number or list instead of a
+    string) is also rejected at the schema level, before safe_calculate ever
+    runs - matching what a malformed tool call from the model would produce."""
+    with pytest.raises(ValidationError):
+        calculator.invoke({"expression": 42})
+    with pytest.raises(ValidationError):
+        calculator.invoke({"expression": ["2+2"]})
 
 
 def test_calculator_docstring_excludes_development_requests():
@@ -120,6 +160,34 @@ def test_run_ruff_file_path_rejects_excluded_directory():
     assert "cannot be checked" in result.lower()
 
 
+def test_run_ruff_code_reports_timeout_without_crashing(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_ruff.invoke({"code": "print('hi')\n"})
+    assert "too long" in result.lower()
+
+
+def test_run_ruff_file_path_reports_timeout_without_crashing(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_ruff.invoke({"file_path": "tools.py"})
+    assert "too long" in result.lower()
+
+
+def test_run_ruff_handles_unexpected_oserror(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("ruff executable not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_ruff.invoke({"code": "print('hi')\n"})
+    assert "error" in result.lower()
+    assert "ruff executable not found" in result
+
+
 def test_run_black_formats_pasted_code():
     messy = "def add(a,b):\n return a+b\n"
     formatted = run_black.invoke({"code": messy})
@@ -173,6 +241,34 @@ def test_run_black_file_path_missing_file():
     assert "not found" in result.lower()
 
 
+def test_run_black_code_reports_timeout_without_crashing(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="black", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_black.invoke({"code": "x=1\n"})
+    assert "too long" in result.lower()
+
+
+def test_run_black_file_path_reports_timeout_without_crashing(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="black", timeout=30)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_black.invoke({"file_path": "tools.py"})
+    assert "too long" in result.lower()
+
+
+def test_run_black_handles_unexpected_oserror(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("black executable not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_black.invoke({"code": "x=1\n"})
+    assert "error" in result.lower()
+    assert "black executable not found" in result
+
+
 # ---------------------------------------------------------------------------
 # list_project_files
 # ---------------------------------------------------------------------------
@@ -207,6 +303,11 @@ def test_read_project_file_reads_real_file():
     result = read_project_file.invoke({"file_path": "conftest.py"})
     assert "Contents of 'conftest.py'" in result
     assert "pytest" in result.lower()
+
+
+def test_read_project_file_missing_file_path_raises_validation_error():
+    with pytest.raises(ValidationError):
+        read_project_file.invoke({})
 
 
 def test_read_project_file_rejects_outside_project_root():
