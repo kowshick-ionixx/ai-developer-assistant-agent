@@ -10,6 +10,7 @@ the Documents/Changes pages where attachment clearing and change approval
 now live in the redesigned UI.
 """
 
+import io
 import re
 import types
 from pathlib import Path
@@ -1054,13 +1055,18 @@ def test_applied_change_disappears_from_pending_and_cannot_be_reapproved(
 
 @pytest.fixture(autouse=True)
 def _clean_zip_cache():
-    """tools.py's packaging cache (_ZIP_CACHE) is a process-wide module-level
-    store, the same single-user pattern as workflow.py's registries - reset
-    it around every test in this file so one test's archive can never make
-    another test's "was it actually rebuilt?" assertion see stale state."""
+    """tools.py's packaging caches (_ZIP_CACHE for the whole-assistant
+    archive, _GENERATED_ZIP_CACHE for a generated sub-project's own archive)
+    are process-wide module-level stores, the same single-user pattern as
+    workflow.py's registries - reset them around every test in this file so
+    one test's archive can never make another test's "was it actually
+    rebuilt?" assertion see stale state, and so a same-second rebuild in one
+    test can never reuse cached bytes for a dist/ file another test already
+    cleaned up below."""
     import tools
 
     tools._ZIP_CACHE.update(signature=None, bytes=None, filename=None, report=None)
+    tools._GENERATED_ZIP_CACHE.clear()
     yield
     dist_dir = tools.PROJECT_ROOT / "dist"
     if dist_dir.exists():
@@ -1457,7 +1463,7 @@ def test_stop_app_button_stops_and_shows_not_running(
 
 
 def test_live_application_section_coexists_with_zip_download(
-    apptest_with_mocked_agent, monkeypatch
+    apptest_with_mocked_agent, monkeypatch, scratch_generated_app_dir
 ):
     """Adding the live-preview section must never break the existing ZIP
     download button - both can be shown for the same completed task."""
@@ -1475,3 +1481,147 @@ def test_live_application_section_coexists_with_zip_download(
         b for b in at.download_button if b.key == "download_project_zip"
     ]
     assert len(download_buttons) == 1
+
+
+def test_zip_download_for_generated_project_packages_only_that_project(
+    apptest_with_mocked_agent, monkeypatch, scratch_generated_app_dir
+):
+    """Once a task actually built a generated sub-project (e.g. a to-do
+    app), the downloadable archive must contain ONLY that sub-project's own
+    files - never this whole AI Developer Assistant repository. Regression
+    coverage for a real bug: the download button used to always call
+    get_or_build_project_zip() (the whole-assistant archive) even when the
+    completed task was a generated sub-project.
+
+    Follows the same capture-and-verify pattern as
+    test_download_button_serves_the_real_valid_archive_from_disk: the AppTest
+    DownloadButton element's proto only carries a deferred_file_id handle
+    (the real bytes live in Streamlit's own media file storage), so the
+    actual archive is verified via the real get_or_build_generated_project_zip
+    call and the real file it wrote to dist/.
+    """
+    import zipfile
+
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+    import tools
+
+    _set_generated_app_verified(
+        agent_module, monkeypatch, _apply_fake_generated_change()
+    )
+
+    captured: dict = {}
+    real_get_or_build = tools.get_or_build_generated_project_zip
+
+    def capturing_get_or_build(*args, **kwargs):
+        package = real_get_or_build(*args, **kwargs)
+        captured["package"] = package
+        return package
+
+    monkeypatch.setattr(
+        tools, "get_or_build_generated_project_zip", capturing_get_or_build
+    )
+
+    at.chat_input[0].set_value("Build a to-do app").run(timeout=30)
+    at.run(timeout=30)
+    assert at.exception == []
+
+    download_buttons = [
+        b for b in at.download_button if b.key == "download_project_zip"
+    ]
+    assert len(download_buttons) == 1
+    assert "package" in captured
+    package = captured["package"]
+
+    assert package["filename"] == "apptest_todo.zip"
+    assert package["files"] == ["_apptest_todo/app.py"]
+    assert not any(f.startswith("generated_projects/") for f in package["files"])
+    assert "tools.py" not in package["files"]
+    assert "workflow.py" not in package["files"]
+
+    on_disk = tools.PROJECT_ROOT / "dist" / package["filename"]
+    assert on_disk.is_file()
+    assert on_disk.read_bytes() == package["bytes"]
+    with zipfile.ZipFile(io.BytesIO(package["bytes"])) as archive:
+        assert archive.namelist() == ["_apptest_todo/app.py"]
+
+
+def test_zip_scopes_to_generated_project_when_applied_via_apply_button(
+    apptest_with_mocked_agent, monkeypatch, scratch_generated_app_dir
+):
+    """Regression test for a real bug: a generated project's proposed files
+    are normally written to disk via this UI's own "Apply Approved Changes"
+    button (tools.apply_approved_change_set), NOT via the agent calling the
+    apply_approved_change tool itself - but _current_generated_project_root()
+    used to look ONLY for an "apply_approved_change" tool_call in chat
+    history, which the button path never produces. That made the download
+    button silently fall back to get_or_build_project_zip() (this whole
+    assistant repository) for every project actually built through the real
+    Approve/Apply UI flow, even though a chat-driven apply (as covered by
+    test_zip_download_for_generated_project_packages_only_that_project) was
+    scoped correctly. Uses the real Approve/Apply buttons end to end, never a
+    fabricated apply_approved_change tool_call, to catch exactly this gap.
+    """
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+    import tools
+
+    change = workflow.register_change(
+        file_path=f"{_GENERATED_PROJECT_ROOT}/app.py",
+        action="modify",
+        content="import streamlit as st\nst.write('hi there')\n",
+        reason="generated app (test)",
+    )
+
+    def fake_run_agent_turn_after_apply(agent, history):
+        return {
+            "answer": "Tests pass.",
+            "tool_calls": [
+                {
+                    "name": "run_pytest",
+                    "input": {"target": f"{_GENERATED_PROJECT_ROOT}/tests"},
+                    "output": "Exit code: 0\n\n2 passed in 0.02s",
+                },
+            ],
+            "workflow_states": ["IMPLEMENTING", "TESTING", "REVIEWING", "COMPLETED"],
+        }
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn_after_apply)
+
+    at = _goto(at, "Changes")
+    approve_btn = next(
+        b for b in at.button if b.key == f"approve_set_{change.changeset_id}"
+    )
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    apply_btn = next(
+        b for b in at.button if b.key == f"apply_set_{change.changeset_id}"
+    )
+    apply_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+    assert workflow.get_change(change.change_id).applied is True
+
+    captured: dict = {}
+    real_get_or_build = tools.get_or_build_generated_project_zip
+
+    def capturing_get_or_build(*args, **kwargs):
+        package = real_get_or_build(*args, **kwargs)
+        captured["package"] = package
+        return package
+
+    monkeypatch.setattr(
+        tools, "get_or_build_generated_project_zip", capturing_get_or_build
+    )
+
+    at = _goto(at, "Chat")
+    assert "package" in captured
+    package = captured["package"]
+
+    assert package["files"] == ["_apptest_todo/app.py"]
+    assert not any(f.startswith("generated_projects/") for f in package["files"])
+    assert "tools.py" not in package["files"]
+    assert "workflow.py" not in package["files"]
+    assert "agent.py" not in package["files"]

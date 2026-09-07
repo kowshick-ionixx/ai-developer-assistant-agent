@@ -626,6 +626,10 @@ def _run_and_render_turn(
 
         for tool_call in tool_calls:
             render_tool_box(tool_call)
+            if tool_call.get("name") == "apply_approved_change":
+                st.session_state.applied_change_ids.append(
+                    tool_call.get("input", {}).get("change_id", "")
+                )
 
         render_answer(answer)
         render_workflow_states(workflow_states)
@@ -708,6 +712,15 @@ def _apply_changeset_and_resume(agent, changeset_id: str) -> None:
         st.rerun()
         return
 
+    # Record every change this batch actually wrote to disk, in the real
+    # order apply_approved_change_set applied them - the same real-time log
+    # _run_and_render_turn appends to for the agent's own apply_approved_change
+    # tool calls, so _current_generated_project_root()/_applied_changes_
+    # this_session() see this application correctly no matter which of the
+    # two ways a file actually got written to disk.
+    for entry in applied:
+        st.session_state.applied_change_ids.append(entry["change_id"])
+
     summary = (
         f"✅ {len(applied)} approved change{'s' if len(applied) != 1 else ''} "
         "applied successfully."
@@ -751,13 +764,12 @@ def _applied_changes_this_session() -> list[workflow.ProposedChange]:
     """Changes actually written to disk this session, resolved from the
     real change registry (workflow.get_change keeps a change reachable by
     id even after it's applied - only list_pending_changes() filters those
-    out, since that list is for the *pending* approval queue)."""
+    out, since that list is for the *pending* approval queue). Sourced from
+    st.session_state.applied_change_ids - see _current_generated_project_root
+    for why that log, not chat-message scanning, is the correct source."""
     seen_ids: set[str] = set()
     applied: list[workflow.ProposedChange] = []
-    for tool_call in _find_tool_calls(
-        st.session_state.messages, "apply_approved_change"
-    ):
-        change_id = tool_call["input"].get("change_id", "")
+    for change_id in st.session_state.applied_change_ids:
         if not change_id or change_id in seen_ids:
             continue
         seen_ids.add(change_id)
@@ -882,22 +894,40 @@ def _render_project_package_section(task: dict | None) -> None:
     "success" - if the project can't actually be packaged, this shows a
     real error instead of a download button.
 
-    Calls tools.get_or_build_project_zip() directly (never through the
-    agent), the same way the Project/Git pages already call read-only tools
-    directly for a plain button click - and that function is itself
-    idempotent (see its docstring), so re-rendering this section on every
-    Streamlit rerun never rebuilds/re-saves the archive unless the project's
-    real files actually changed.
+    If this task actually built a generated sub-project (resolved the same
+    way _render_live_application_section resolves it, via
+    _current_generated_project_root/_generated_project_tests_passed), the
+    archive packages ONLY that sub-project's own files
+    (tools.get_or_build_generated_project_zip, source_dir=that project's
+    real folder) - e.g. "todo_app.zip" containing just
+    generated_projects/todo_app/, never this whole assistant's own
+    repository. Only a task that changed THIS assistant's own project falls
+    back to tools.get_or_build_project_zip() (the whole-project archive).
+
+    Both are called directly (never through the agent), the same way the
+    Project/Git pages already call read-only tools directly for a plain
+    button click - and both are themselves idempotent (see their
+    docstrings), so re-rendering this section on every Streamlit rerun never
+    rebuilds/re-saves the archive unless the relevant project's real files
+    actually changed.
     """
     if not task or "COMPLETED" not in task["states"]:
         return
 
-    pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
-    if not pytest_calls:
-        return
-    tests_passed = _parse_pytest_output(pytest_calls[-1]["output"])["exit_code"] == 0
-    if not tests_passed:
-        return  # never offer a package unless the real test suite actually passed
+    generated_project_root = _current_generated_project_root()
+    if generated_project_root:
+        if not _generated_project_tests_passed(generated_project_root):
+            return  # never offer a package unless that project's own tests passed
+        tests_passed = True
+    else:
+        pytest_calls = _find_tool_calls(st.session_state.messages, "run_pytest")
+        if not pytest_calls:
+            return
+        tests_passed = (
+            _parse_pytest_output(pytest_calls[-1]["output"])["exit_code"] == 0
+        )
+        if not tests_passed:
+            return  # never offer a package unless the real test suite actually passed
 
     ruff_calls = _find_tool_calls(st.session_state.messages, "run_ruff")
     black_calls = _find_tool_calls(st.session_state.messages, "run_black")
@@ -932,7 +962,13 @@ def _render_project_package_section(task: dict | None) -> None:
         st.write("")
 
         try:
-            package = tools.get_or_build_project_zip(project_name=task["task"])
+            if generated_project_root:
+                slug = generated_project_root.rsplit("/", 1)[-1]
+                package = tools.get_or_build_generated_project_zip(
+                    source_dir=generated_project_root, project_name=slug
+                )
+            else:
+                package = tools.get_or_build_project_zip(project_name=task["task"])
         except OSError as exc:
             log_error("get_or_build_project_zip_ui", exc)
             st.error("⚠️ Could not create the project archive.")
@@ -943,13 +979,19 @@ def _render_project_package_section(task: dict | None) -> None:
             if package["excluded_secrets"]
             else "None found"
         )
+        st.markdown("**PROJECT PACKAGE**")
+        st.markdown("✅ ZIP Ready")
+        st.caption(
+            f"File: {package['filename']} · "
+            f"Size: {documents.format_size(len(package['bytes']))}"
+        )
         st.caption(
             f"Files included: {package['included']} · "
             f"Files excluded: {package['excluded']} · "
             f"Secrets excluded: {secrets_note}"
         )
         st.download_button(
-            "⬇️ Download Project ZIP",
+            "📦 Download Project ZIP",
             data=package["bytes"],
             file_name=package["filename"],
             mime="application/zip",
@@ -960,13 +1002,14 @@ def _render_project_package_section(task: dict | None) -> None:
 
 def _current_generated_project_root() -> str | None:
     """The generated_projects/<slug> root this session most recently
-    actually applied a change to, if any - derived only from real
-    apply_approved_change tool calls resolved through the real change
-    registry (workflow.get_change), never guessed from chat text."""
-    for tool_call in reversed(
-        _find_tool_calls(st.session_state.messages, "apply_approved_change")
-    ):
-        change_id = tool_call["input"].get("change_id", "")
+    actually applied a change to, if any - derived only from
+    st.session_state.applied_change_ids (populated at the moment each change
+    is really written to disk, whether via the agent's own
+    apply_approved_change tool call or via this UI's batch "Apply Approved
+    Changes" button - see _run_and_render_turn/_apply_changeset_and_resume)
+    resolved through the real change registry (workflow.get_change), never
+    guessed from chat text."""
+    for change_id in reversed(st.session_state.applied_change_ids):
         change = workflow.get_change(change_id)
         if change is None or not change.applied:
             continue
@@ -1066,6 +1109,17 @@ def _request_nav_change(page: str) -> None:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []  # what gets displayed in the chat
+
+if "applied_change_ids" not in st.session_state:
+    # Every change_id actually written to disk this session, in the true
+    # order it was applied - recorded directly at the moment of application
+    # (see _run_and_render_turn and _apply_changeset_and_resume), regardless
+    # of whether the write happened via the agent's own apply_approved_change
+    # tool call or via this UI's batch "Apply Approved Changes" button. This
+    # is the one source _current_generated_project_root() and
+    # _applied_changes_this_session() both read from - never reconstructed
+    # by scanning chat text.
+    st.session_state.applied_change_ids = []
 
 if "lc_history" not in st.session_state:
     st.session_state.lc_history = []  # what gets sent to the agent for context
@@ -1949,6 +2003,7 @@ def render_settings_page() -> None:
         st.session_state.messages = []
         st.session_state.lc_history = []
         st.session_state.pending_prompt = None
+        st.session_state.applied_change_ids = []
         clear_events()
         st.rerun()
 

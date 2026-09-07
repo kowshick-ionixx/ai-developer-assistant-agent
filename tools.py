@@ -2321,9 +2321,9 @@ def get_or_build_generated_project_zip(
     source_dir = (source_dir or "").strip().strip("/")
     if not source_dir:
         raise OSError("no source_dir was provided")
-    scan_root = _resolve_safe_path(source_dir)
-    if scan_root is None or not scan_root.is_dir():
-        raise OSError(f"'{source_dir}' was not found in the project")
+    scan_root, error = _validate_generated_project_dir(source_dir)
+    if scan_root is None:
+        raise OSError(error)
 
     scan = _scan_project_files(scan_root)
     included = scan["included"]
@@ -2603,6 +2603,15 @@ def get_generated_server(project_root: str) -> _GeneratedServer | None:
 
 
 def _validate_generated_project_dir(project_root: str) -> tuple[Path | None, str]:
+    """Resolve `project_root` and confirm it is a real, individually-named
+    project folder directly under 'generated_projects/' - never the
+    assistant's own project root, never 'generated_projects/' itself (which
+    would sweep every generated project together), and never a path that
+    escapes the project root via '..' or a symlink (both already rejected by
+    _resolve_safe_path, which resolves the path and checks it against
+    PROJECT_ROOT). Shared by every operation that must be scoped to exactly
+    one generated project: launch/stop of the live preview and packaging
+    its ZIP archive."""
     safe_dir = _resolve_safe_path(project_root)
     if safe_dir is None or not safe_dir.is_dir():
         return None, f"'{project_root}' was not found in the project."
@@ -2610,8 +2619,13 @@ def _validate_generated_project_dir(project_root: str) -> tuple[Path | None, str
         rel_parts = safe_dir.relative_to(PROJECT_ROOT).parts
     except ValueError:
         rel_parts = ()
-    if not rel_parts or rel_parts[0] != "generated_projects":
-        return None, "only a project under 'generated_projects/' can be launched live."
+    if len(rel_parts) < 2 or rel_parts[0] != "generated_projects":
+        message = (
+            "only one specific project under 'generated_projects/<name>' can be "
+            "used here - not the assistant's own project root and not the "
+            "'generated_projects' folder itself."
+        )
+        return None, message
     return safe_dir, ""
 
 

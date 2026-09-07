@@ -437,6 +437,25 @@ def test_generated_project_zip_rejects_path_traversal():
         get_or_build_generated_project_zip(source_dir="../outside")
 
 
+def test_generated_project_zip_rejects_the_assistant_root_itself():
+    """source_dir="." resolves to PROJECT_ROOT - packaging it as a
+    "generated project" would zip this whole assistant workspace (agent.py,
+    tools.py, workflow.py, every generated project) under a misleading
+    project-scoped filename. Must be rejected the same as any other invalid
+    root, never silently treated as valid."""
+    with pytest.raises(OSError):
+        get_or_build_generated_project_zip(source_dir=".")
+
+
+def test_generated_project_zip_rejects_the_generated_projects_parent_dir():
+    """source_dir="generated_projects" (the parent folder itself, not one
+    specific project under it) must be rejected - packaging it would bundle
+    every generated project together into one archive instead of exactly
+    one."""
+    with pytest.raises(OSError):
+        get_or_build_generated_project_zip(source_dir="generated_projects")
+
+
 def test_generated_project_zip_is_idempotent(scratch_generated_project):
     first = get_or_build_generated_project_zip(
         source_dir="generated_projects/_scratch_app"
