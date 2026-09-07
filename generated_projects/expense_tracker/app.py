@@ -1,94 +1,71 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from database import ExpenseDatabase
+from database import init_db, add_transaction, get_transactions, delete_transaction
 
-st.set_page_config(page_title="Expense Tracker", page_icon="💰", layout="wide")
+# Initialize database
+init_db()
 
-@st.cache_resource
-def get_db():
-    return ExpenseDatabase()
-
-db = get_db()
+st.set_page_config(page_title="Expense Tracker App", page_icon="💰", layout="wide")
 
 st.title("💰 Personal Expense Tracker")
-
-# Sidebar navigation
-menu = st.sidebar.selectbox("Navigation", ["Dashboard", "Manage Expenses"])
+st.sidebar.title("Navigation")
+menu = st.sidebar.radio("Go to", ["Dashboard", "Add Transaction", "History & Delete"])
 
 if menu == "Dashboard":
     st.header("Financial Dashboard")
+    df = get_transactions()
     
-    expenses = db.get_expenses()
-    
-    if not expenses:
-        st.info("No expenses recorded yet. Go to 'Manage Expenses' to add some!")
+    if df.empty:
+        st.info("No transactions recorded yet. Go to 'Add Transaction' to get started!")
     else:
-        df = pd.DataFrame(expenses)
-        df['amount'] = pd.to_numeric(df['amount'])
+        total_income = df[df['type'] == 'Income']['amount'].sum()
+        total_expense = df[df['type'] == 'Expense']['amount'].sum()
+        net_savings = total_income - total_expense
         
-        total_spent = df['amount'].sum()
-        total_transactions = len(df)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Income", f"${total_income:,.2f}")
+        col2.metric("Total Expenses", f"${total_expense:,.2f}")
+        col3.metric("Net Savings", f"${net_savings:,.2f}")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Expenses", f"${total_spent:,.2f}")
-        with col2:
-            st.metric("Total Transactions", total_transactions)
-            
-        st.subheader("Category-wise Spending")
-        category_totals = db.get_category_totals()
-        if category_totals:
-            cat_df = pd.DataFrame(category_totals)
-            cat_df.set_index('category', inplace=True)
-            st.bar_chart(cat_df['total'])
-            
         st.subheader("Recent Transactions")
-        st.dataframe(df[['date', 'category', 'amount', 'description']].head(10), use_container_width=True)
-
-elif menu == "Manage Expenses":
-    st.header("Manage Expenses")
-    
-    with st.form("expense_form", clear_on_submit=True):
-        st.subheader("Add New Expense")
-        amount = st.number_input("Amount ($)", min_value=0.01, format="%.2f")
-        category = st.selectbox("Category", ["Food", "Transport", "Housing", "Utilities", "Entertainment", "Other"])
-        date = st.date_input("Date", value=datetime.today())
-        description = st.text_input("Description")
+        st.dataframe(df.head(10), use_container_width=True)
         
-        submitted = st.form_submit_button("Add Expense")
+        if not df[df['type'] == 'Expense'].empty:
+            st.subheader("Expenses by Category")
+            exp_df = df[df['type'] == 'Expense']
+            cat_summary = exp_df.groupby('category')['amount'].sum()
+            st.bar_chart(cat_summary)
+
+elif menu == "Add Transaction":
+    st.header("Add New Transaction")
+    with st.form("transaction_form"):
+        t_type = st.selectbox("Type", ["Expense", "Income"])
+        title = st.text_input("Description / Title")
+        amount = st.number_input("Amount ($)", min_value=0.01, step=0.01)
+        category = st.selectbox("Category", ["Food", "Rent", "Utilities", "Entertainment", "Transport", "Salary", "Freelance", "Other"])
+        date = st.date_input("Date", value=datetime.today())
+        
+        submitted = st.form_submit_button("Save Transaction")
         if submitted:
-            if amount > 0:
-                db.add_expense(amount, category, str(date), description)
-                st.success("Expense added successfully!")
-                st.rerun()
+            if title.strip() == "":
+                st.error("Please enter a valid description.")
             else:
-                st.error("Amount must be greater than zero.")
-                
-    st.subheader("Existing Expenses")
-    expenses = db.get_expenses()
+                add_transaction(str(date), title, amount, category, t_type)
+                st.success(f"Added {t_type}: {title} (${amount:,.2f}) successfully!")
+
+elif menu == "History & Delete":
+    st.header("Transaction History & Management")
+    df = get_transactions()
     
-    if expenses:
-        for exp in expenses:
-            with st.expander(f"{exp['date']} | {exp['category']} | ${exp['amount']:.2f} - {exp['description'] or 'No description'}"):
-                with st.form(f"edit_form_{exp['id']}"):
-                    new_amount = st.number_input("Amount ($)", min_value=0.01, value=float(exp['amount']), format="%.2f", key=f"amt_{exp['id']}")
-                    categories = ["Food", "Transport", "Housing", "Utilities", "Entertainment", "Other"]
-                    default_cat_idx = categories.index(exp['category']) if exp['category'] in categories else 0
-                    new_category = st.selectbox("Category", categories, index=default_cat_idx, key=f"cat_{exp['id']}")
-                    new_date = st.date_input("Date", value=datetime.strptime(exp['date'], "%Y-%m-%d").date(), key=f"date_{exp['id']}")
-                    new_desc = st.text_input("Description", value=exp['description'] or "", key=f"desc_{exp['id']}")
-                    
-                    col_save, col_del = st.columns(2)
-                    with col_save:
-                        if st.form_submit_button("Save Changes"):
-                            db.update_expense(exp['id'], new_amount, new_category, str(new_date), new_desc)
-                            st.success("Expense updated!")
-                            st.rerun()
-                    with col_del:
-                        if st.form_submit_button("Delete"):
-                            db.delete_expense(exp['id'])
-                            st.success("Expense deleted!")
-                            st.rerun()
+    if df.empty:
+        st.info("No transactions found.")
     else:
-        st.info("No expenses found.")
+        st.dataframe(df, use_container_width=True)
+        
+        st.subheader("Delete a Transaction")
+        t_id = st.selectbox("Select Transaction ID to Delete", df['id'].tolist())
+        if st.button("Delete Selected"):
+            delete_transaction(t_id)
+            st.success(f"Transaction ID {t_id} deleted successfully!")
+            st.experimental_rerun()

@@ -1,11 +1,12 @@
-# Expense Tracker
+# Expense Tracker App
 
-A simple and robust Expense Tracker application built with Python, Streamlit, Pandas, and SQLite.
+A simple and interactive personal finance tracker built with Python and Streamlit.
 
 ## Features
-- Add, edit, and delete expenses (Amount, Category, Date, Description).
-- SQLite persistent storage.
-- Dashboard with total expenses, category-wise breakdown, and recent transactions.
+- Track Income and Expenses
+- Categorize transactions (Food, Rent, Salary, etc.)
+- View financial metrics and summary charts
+- Manage and delete records
 
 ## Installation & Running
 1. Install dependencies:

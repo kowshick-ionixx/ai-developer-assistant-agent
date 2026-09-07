@@ -1,48 +1,30 @@
 import os
 import tempfile
 import pytest
-from database import ExpenseDatabase
+from database import init_db, add_transaction, get_transactions, delete_transaction
 
 @pytest.fixture
-def temp_db():
-    fd, path = tempfile.mkstemp()
-    os.close(fd)
-    db = ExpenseDatabase(db_path=path)
-    yield db
-    os.unlink(path)
+def temp_db(tmp_path):
+    db_file = tmp_path / "test_expenses.db"
+    db_path = str(db_file)
+    init_db(db_path)
+    return db_path
 
 def test_add_and_get_expenses(temp_db):
-    temp_db.add_expense(50.0, "Food", "2023-10-01", "Lunch")
-    expenses = temp_db.get_expenses()
-    assert len(expenses) == 1
-    assert expenses[0]['amount'] == 50.0
-    assert expenses[0]['category'] == "Food"
-    assert expenses[0]['date'] == "2023-10-01"
-    assert expenses[0]['description'] == "Lunch"
-
-def test_update_expense(temp_db):
-    exp_id = temp_db.add_expense(20.0, "Transport", "2023-10-02", "Bus")
-    temp_db.update_expense(exp_id, 25.0, "Transport", "2023-10-02", "Subway")
-    
-    expenses = temp_db.get_expenses()
-    assert len(expenses) == 1
-    assert expenses[0]['amount'] == 25.0
-    assert expenses[0]['description'] == "Subway"
+    add_transaction("2023-10-01", "Lunch", 50.0, "Food", "Expense", temp_db)
+    df = get_transactions(temp_db)
+    assert len(df) == 1
+    assert df.iloc[0]['amount'] == 50.0
+    assert df.iloc[0]['category'] == "Food"
+    assert df.iloc[0]['date'] == "2023-10-01"
+    assert df.iloc[0]['title'] == "Lunch"
 
 def test_delete_expense(temp_db):
-    exp_id = temp_db.add_expense(10.0, "Utilities", "2023-10-03", "Water")
-    assert len(temp_db.get_expenses()) == 1
+    add_transaction("2023-10-03", "Water", 10.0, "Utilities", "Expense", temp_db)
+    df = get_transactions(temp_db)
+    assert len(df) == 1
+    t_id = int(df.iloc[0]['id'])
     
-    temp_db.delete_expense(exp_id)
-    assert len(temp_db.get_expenses()) == 0
-
-def test_category_totals(temp_db):
-    temp_db.add_expense(30.0, "Food", "2023-10-01", "Breakfast")
-    temp_db.add_expense(20.0, "Food", "2023-10-02", "Dinner")
-    temp_db.add_expense(100.0, "Housing", "2023-10-01", "Rent")
-    
-    totals = temp_db.get_category_totals()
-    totals_dict = {item['category']: item['total'] for item in totals}
-    
-    assert totals_dict["Food"] == 50.0
-    assert totals_dict["Housing"] == 100.0
+    delete_transaction(t_id, temp_db)
+    df_after = get_transactions(temp_db)
+    assert df_after.empty
