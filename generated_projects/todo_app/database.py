@@ -3,6 +3,7 @@ from datetime import datetime
 
 DB_NAME = "todo.db"
 
+
 def init_db(db_path=DB_NAME):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -17,23 +18,34 @@ def init_db(db_path=DB_NAME):
     conn.commit()
     conn.close()
 
+
 def add_task(description, db_path=DB_NAME):
     if not description or not description.strip():
         raise ValueError("Task description cannot be empty.")
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     created_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT INTO tasks (description, completed, created_date) VALUES (?, 0, ?)", (description.strip(), created_date))
+    cursor.execute(
+        "INSERT INTO tasks (description, completed, created_date) VALUES (?, 0, ?)",
+        (description.strip(), created_date),
+    )
     conn.commit()
     conn.close()
+
 
 def get_tasks(db_path=DB_NAME):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, description, completed, created_date FROM tasks ORDER BY id DESC")
+    cursor.execute(
+        "SELECT id, description, completed, created_date FROM tasks ORDER BY id DESC"
+    )
     rows = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "description": r[1], "completed": bool(r[2]), "created_date": r[3]} for r in rows]
+    return [
+        {"id": r[0], "description": r[1], "completed": bool(r[2]), "created_date": r[3]}
+        for r in rows
+    ]
+
 
 def complete_task(task_id, db_path=DB_NAME):
     conn = sqlite3.connect(db_path)
@@ -42,12 +54,14 @@ def complete_task(task_id, db_path=DB_NAME):
     conn.commit()
     conn.close()
 
+
 def delete_task(task_id, db_path=DB_NAME):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.commit()
     conn.close()
+
 
 def get_task_counts(db_path=DB_NAME):
     tasks = get_tasks(db_path)

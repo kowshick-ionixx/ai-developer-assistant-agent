@@ -2050,7 +2050,7 @@ def test_project_tab_shows_only_the_active_generated_project(
     apptest_with_mocked_agent, two_scratch_generated_projects
 ):
     at = apptest_with_mocked_agent
-    first_root, _second_root = two_scratch_generated_projects
+    _first_root, _second_root = two_scratch_generated_projects
 
     change = workflow.register_change(
         file_path="generated_projects/_apptest_first/app.py",
@@ -2074,7 +2074,7 @@ def test_project_tab_switches_to_the_newly_generated_project(
     """Generating project A then project B must flip the Project tab from
     showing only A to showing only B - never both at once."""
     at = apptest_with_mocked_agent
-    first_root, second_root = two_scratch_generated_projects
+    _first_root, _second_root = two_scratch_generated_projects
 
     change_a = workflow.register_change(
         file_path="generated_projects/_apptest_first/app.py",
@@ -2109,7 +2109,7 @@ def test_project_tab_refresh_still_scopes_to_the_active_project(
     apptest_with_mocked_agent, two_scratch_generated_projects
 ):
     at = apptest_with_mocked_agent
-    first_root, _second_root = two_scratch_generated_projects
+    _first_root, _second_root = two_scratch_generated_projects
 
     change = workflow.register_change(
         file_path="generated_projects/_apptest_first/app.py",

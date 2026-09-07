@@ -1,19 +1,24 @@
 import sqlite3
 from datetime import date
+
 from database import Database
+
 
 class LibraryManager:
     def __init__(self, db_path="library.db"):
-        self.db = Database(db_path)
+        self.db = db_path if isinstance(db_path, Database) else Database(db_path)
 
     def add_book(self, title, author, isbn, category, total_qty):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO books (title, author, isbn, category, total_qty, available_qty)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (title, author, isbn, category, total_qty, total_qty))
+                """,
+                    (title, author, isbn, category, total_qty, total_qty),
+                )
                 conn.commit()
                 return cursor.lastrowid
             except sqlite3.IntegrityError:
@@ -22,31 +27,41 @@ class LibraryManager:
     def get_all_books(self):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, title, author, isbn, category, total_qty, available_qty FROM books")
+            cursor.execute(
+                "SELECT id, title, author, isbn, category, total_qty, available_qty FROM books"
+            )
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
     def update_book(self, book_id, title, author, isbn, category, total_qty):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT total_qty, available_qty FROM books WHERE id = ?", (book_id,))
+            cursor.execute(
+                "SELECT total_qty, available_qty FROM books WHERE id = ?", (book_id,)
+            )
             row = cursor.fetchone()
             if not row:
                 return False
             old_total, old_available = row["total_qty"], row["available_qty"]
             diff = total_qty - old_total
             new_available = max(0, old_available + diff)
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE books SET title = ?, author = ?, isbn = ?, category = ?, total_qty = ?, available_qty = ?
                 WHERE id = ?
-            """, (title, author, isbn, category, total_qty, new_available, book_id))
+            """,
+                (title, author, isbn, category, total_qty, new_available, book_id),
+            )
             conn.commit()
             return True
 
     def delete_book(self, book_id):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as count FROM borrowings WHERE book_id = ? AND return_date IS NULL", (book_id,))
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM borrowings WHERE book_id = ? AND return_date IS NULL",
+                (book_id,),
+            )
             if cursor.fetchone()["count"] > 0:
                 return False, "Cannot delete book currently on active loan."
             cursor.execute("DELETE FROM books WHERE id = ?", (book_id,))
@@ -57,29 +72,38 @@ class LibraryManager:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             q = f"%{query}%"
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT id, title, author, isbn, category, total_qty, available_qty FROM books
                 WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ?
-            """, (q, q, q))
+            """,
+                (q, q, q),
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def filter_books_by_category(self, category):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT id, title, author, isbn, category, total_qty, available_qty FROM books
                 WHERE category = ?
-            """, (category,))
+            """,
+                (category,),
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def register_member(self, member_id, name, email, phone):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO members (member_id, name, email, phone)
                     VALUES (?, ?, ?, ?)
-                """, (member_id, name, email, phone))
+                """,
+                    (member_id, name, email, phone),
+                )
                 conn.commit()
                 return cursor.lastrowid
             except sqlite3.IntegrityError:
@@ -95,10 +119,13 @@ class LibraryManager:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     UPDATE members SET member_id = ?, name = ?, email = ?, phone = ?
                     WHERE id = ?
-                """, (member_id, name, email, phone, member_pk))
+                """,
+                    (member_id, name, email, phone, member_pk),
+                )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -107,7 +134,10 @@ class LibraryManager:
     def delete_member(self, member_pk):
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as count FROM borrowings WHERE member_id = ? AND return_date IS NULL", (member_pk,))
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM borrowings WHERE member_id = ? AND return_date IS NULL",
+                (member_pk,),
+            )
             if cursor.fetchone()["count"] > 0:
                 return False, "Cannot delete member with active borrowing records."
             cursor.execute("DELETE FROM members WHERE id = ?", (member_pk,))
@@ -118,10 +148,13 @@ class LibraryManager:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             q = f"%{query}%"
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT id, member_id, name, email, phone FROM members
                 WHERE member_id LIKE ? OR name LIKE ?
-            """, (q, q))
+            """,
+                (q, q),
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def borrow_book(self, member_id, book_id, borrow_date=None, due_date=None):
@@ -129,6 +162,7 @@ class LibraryManager:
             borrow_date = date.today().isoformat()
         if due_date is None:
             from datetime import timedelta
+
             due_date = (date.today() + timedelta(days=14)).isoformat()
 
         with self.db.get_connection() as conn:
@@ -140,22 +174,34 @@ class LibraryManager:
                 return False, "Book is not available for borrowing."
 
             # Check duplicate active borrowing
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT id FROM borrowings WHERE member_id = ? AND book_id = ? AND return_date IS NULL
-            """, (member_id, book_id))
+            """,
+                (member_id, book_id),
+            )
             if cursor.fetchone():
-                return False, "Member already has an active borrowing record for this book."
+                return (
+                    False,
+                    "Member already has an active borrowing record for this book.",
+                )
 
             # Insert borrowing
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO borrowings (member_id, book_id, borrow_date, due_date)
                 VALUES (?, ?, ?, ?)
-            """, (member_id, book_id, borrow_date, due_date))
+            """,
+                (member_id, book_id, borrow_date, due_date),
+            )
 
             # Reduce available quantity
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE books SET available_qty = available_qty - 1 WHERE id = ?
-            """, (book_id,))
+            """,
+                (book_id,),
+            )
             conn.commit()
             return True, "Book borrowed successfully."
 
@@ -165,9 +211,12 @@ class LibraryManager:
 
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT book_id, return_date FROM borrowings WHERE id = ?
-            """, (borrowing_id,))
+            """,
+                (borrowing_id,),
+            )
             row = cursor.fetchone()
             if not row:
                 return False, "Borrowing record not found."
@@ -176,13 +225,19 @@ class LibraryManager:
 
             book_id = row["book_id"]
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE borrowings SET return_date = ? WHERE id = ?
-            """, (return_date, borrowing_id))
+            """,
+                (return_date, borrowing_id),
+            )
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE books SET available_qty = available_qty + 1 WHERE id = ?
-            """, (book_id,))
+            """,
+                (book_id,),
+            )
             conn.commit()
             return True, "Book returned successfully."
 
@@ -201,10 +256,13 @@ class LibraryManager:
     def get_overdue_borrowings(self, current_date=None):
         if current_date is None:
             current_date = date.today().isoformat()
+        today = date.fromisoformat(current_date)
         borrowings = self.get_all_borrowings()
         overdue = []
         for b in borrowings:
             if b["return_date"] is None and b["due_date"] < current_date:
+                b = dict(b)
+                b["days_overdue"] = (today - date.fromisoformat(b["due_date"])).days
                 overdue.append(b)
         return overdue
 
@@ -214,7 +272,9 @@ class LibraryManager:
             cursor.execute("SELECT COUNT(*) as cnt FROM books")
             total_titles = cursor.fetchone()["cnt"]
 
-            cursor.execute("SELECT SUM(total_qty) as total, SUM(available_qty) as avail FROM books")
+            cursor.execute(
+                "SELECT SUM(total_qty) as total, SUM(available_qty) as avail FROM books"
+            )
             row = cursor.fetchone()
             total_books = row["total"] or 0
             available_books = row["avail"] or 0
@@ -222,11 +282,16 @@ class LibraryManager:
             cursor.execute("SELECT COUNT(*) as cnt FROM members")
             total_members = cursor.fetchone()["cnt"]
 
-            cursor.execute("SELECT COUNT(*) as cnt FROM borrowings WHERE return_date IS NULL")
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM borrowings WHERE return_date IS NULL"
+            )
             active_loans = cursor.fetchone()["cnt"]
 
             today = date.today().isoformat()
-            cursor.execute("SELECT COUNT(*) as cnt FROM borrowings WHERE return_date IS NULL AND due_date < ?", (today,))
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM borrowings WHERE return_date IS NULL AND due_date < ?",
+                (today,),
+            )
             overdue_loans = cursor.fetchone()["cnt"]
 
             return {
@@ -235,5 +300,5 @@ class LibraryManager:
                 "available_books": available_books,
                 "total_members": total_members,
                 "active_loans": active_loans,
-                "overdue_loans": overdue_loans
+                "overdue_loans": overdue_loans,
             }

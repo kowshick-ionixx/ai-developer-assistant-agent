@@ -1,5 +1,7 @@
 """Advanced calculator operations (Combinations, Permutations, GCD, LCM, etc.)."""
+
 import math
+
 
 def combinations(n: int, r: int) -> int:
     if not (isinstance(n, int) and isinstance(r, int)):
@@ -14,6 +16,7 @@ def combinations(n: int, r: int) -> int:
         raise ValueError("r cannot be greater than n in combinations")
     return math.comb(n, r)
 
+
 def permutations(n: int, r: int) -> int:
     if not (isinstance(n, int) and isinstance(r, int)):
         try:
@@ -27,12 +30,14 @@ def permutations(n: int, r: int) -> int:
         raise ValueError("r cannot be greater than n in permutations")
     return math.perm(n, r)
 
+
 def gcd_func(a: int, b: int) -> int:
     try:
         ia, ib = int(a), int(b)
     except Exception:
         raise ValueError("GCD arguments must be integers")
     return math.gcd(ia, ib)
+
 
 def lcm_func(a: int, b: int) -> int:
     try:
@@ -43,16 +48,20 @@ def lcm_func(a: int, b: int) -> int:
         return 0
     return abs(ia * ib) // math.gcd(ia, ib)
 
+
 def floor_func(x: float) -> int:
     return math.floor(x)
 
+
 def ceiling_func(x: float) -> int:
     return math.ceil(x)
+
 
 def scientific_notation(x: float, decimals: int = 4) -> str:
     if not math.isfinite(x):
         return str(x)
     return f"{x:.{decimals}e}"
+
 
 # Aliases matching the names app.py imports
 nCr = combinations

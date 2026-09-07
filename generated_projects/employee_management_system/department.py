@@ -1,5 +1,7 @@
-from database import get_connection
 import sqlite3
+
+from database import get_connection
+
 
 def add_department(name, db_path="ems.db"):
     if not name or not name.strip():
@@ -15,6 +17,7 @@ def add_department(name, db_path="ems.db"):
     finally:
         conn.close()
 
+
 def get_departments(db_path="ems.db"):
     conn = get_connection(db_path)
     cursor = conn.cursor()
@@ -22,6 +25,7 @@ def get_departments(db_path="ems.db"):
     rows = cursor.fetchall()
     conn.close()
     return [{"id": r[0], "name": r[1]} for r in rows]
+
 
 def update_department(dept_id, new_name, db_path="ems.db"):
     if not new_name or not new_name.strip():
@@ -34,15 +38,21 @@ def update_department(dept_id, new_name, db_path="ems.db"):
         if not row:
             return False, "Department not found."
         old_name = row[0]
-        
-        cursor.execute("UPDATE departments SET name = ? WHERE id = ?", (new_name.strip(), dept_id))
-        cursor.execute("UPDATE employees SET department = ? WHERE department = ?", (new_name.strip(), old_name))
+
+        cursor.execute(
+            "UPDATE departments SET name = ? WHERE id = ?", (new_name.strip(), dept_id)
+        )
+        cursor.execute(
+            "UPDATE employees SET department = ? WHERE department = ?",
+            (new_name.strip(), old_name),
+        )
         conn.commit()
         return True, "Department updated successfully."
     except sqlite3.IntegrityError:
         return False, "Department name already exists."
     finally:
         conn.close()
+
 
 def delete_department(dept_id, db_path="ems.db"):
     conn = get_connection(db_path)
@@ -53,12 +63,17 @@ def delete_department(dept_id, db_path="ems.db"):
         if not row:
             return False, "Department not found."
         dept_name = row[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM employees WHERE department = ?", (dept_name,))
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM employees WHERE department = ?", (dept_name,)
+        )
         count = cursor.fetchone()[0]
         if count > 0:
-            return False, f"Cannot delete department '{dept_name}' because it has {count} assigned employee(s)."
-        
+            return (
+                False,
+                f"Cannot delete department '{dept_name}' because it has {count} assigned employee(s).",
+            )
+
         cursor.execute("DELETE FROM departments WHERE id = ?", (dept_id,))
         conn.commit()
         return True, "Department deleted successfully."

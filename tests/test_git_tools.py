@@ -7,12 +7,12 @@ pattern test_agent.py uses to fake the LangChain agent) so these tests never
 need a real `git` executable or a real repository on disk.
 """
 
-import datetime
+import datetime  # noqa: I001 - `tools` must import before `git.exc` so git executable discovery runs first
 
 import pytest
 from pydantic import ValidationError
 
-import tools  # noqa: I001 - must import before git.exc so git executable discovery runs first
+import tools
 from git.exc import GitCommandError
 from tools import git_branch, git_diff, git_log, git_status
 

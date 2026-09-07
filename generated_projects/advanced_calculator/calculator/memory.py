@@ -1,5 +1,6 @@
 """Memory functions for calculator (MC, MR, M+, M-, MS)."""
 
+
 class CalculatorMemory:
     def __init__(self):
         self.memory = 0.0

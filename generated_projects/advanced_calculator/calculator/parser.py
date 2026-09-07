@@ -1,9 +1,29 @@
 """Safe mathematical expression parser using AST."""
+
 import ast
-import operator
 import math
-from .basic import add, subtract, multiply, divide, modulus, power, factorial, square_root
-from .scientific import sin_func, cos_func, tan_func, asin_func, acos_func, atan_func, sinh_func, cosh_func, tanh_func, log10_func, ln_func, exp_func, power_10, PI, E
+import operator
+
+from .basic import (
+    factorial,
+    square_root,
+)
+from .scientific import (
+    PI,
+    E,
+    acos_func,
+    asin_func,
+    atan_func,
+    cos_func,
+    cosh_func,
+    exp_func,
+    ln_func,
+    log10_func,
+    sin_func,
+    sinh_func,
+    tan_func,
+    tanh_func,
+)
 
 SUPPORTED_OPERATORS = {
     ast.Add: operator.add,
@@ -18,35 +38,36 @@ SUPPORTED_OPERATORS = {
 }
 
 SUPPORTED_FUNCTIONS = {
-    'sin': sin_func,
-    'cos': cos_func,
-    'tan': tan_func,
-    'asin': asin_func,
-    'acos': acos_func,
-    'atan': atan_func,
-    'sinh': sinh_func,
-    'cosh': cosh_func,
-    'tanh': tanh_func,
-    'log10': log10_func,
-    'ln': ln_func,
-    'log': ln_func,
-    'exp': exp_func,
-    'sqrt': square_root,
-    'fact': factorial,
-    'factorial': factorial,
-    'abs': abs,
-    'round': round,
-    'floor': math.floor,
-    'ceil': math.ceil,
+    "sin": sin_func,
+    "cos": cos_func,
+    "tan": tan_func,
+    "asin": asin_func,
+    "acos": acos_func,
+    "atan": atan_func,
+    "sinh": sinh_func,
+    "cosh": cosh_func,
+    "tanh": tanh_func,
+    "log10": log10_func,
+    "ln": ln_func,
+    "log": ln_func,
+    "exp": exp_func,
+    "sqrt": square_root,
+    "fact": factorial,
+    "factorial": factorial,
+    "abs": abs,
+    "round": round,
+    "floor": math.floor,
+    "ceil": math.ceil,
 }
 
 SUPPORTED_CONSTANTS = {
-    'pi': PI,
-    'e': E,
+    "pi": PI,
+    "e": E,
 }
 
+
 class SafeEvalVisitor(ast.NodeVisitor):
-    def __init__(self, mode='rad'):
+    def __init__(self, mode="rad"):
         self.mode = mode
 
     def visit(self, node):
@@ -86,7 +107,7 @@ class SafeEvalVisitor(ast.NodeVisitor):
                     args = [self.visit(arg) for arg in node.args]
                     func = SUPPORTED_FUNCTIONS[func_name]
                     try:
-                        if func_name in ['sin', 'cos', 'tan', 'asin', 'acos', 'atan']:
+                        if func_name in ["sin", "cos", "tan", "asin", "acos", "atan"]:
                             return func(*args, mode=self.mode)
                         else:
                             return func(*args)
@@ -99,12 +120,13 @@ class SafeEvalVisitor(ast.NodeVisitor):
         else:
             raise ValueError(f"Unsupported expression syntax: {type(node).__name__}")
 
-def evaluate_expression(expr: str, mode: str = 'rad') -> float:
+
+def evaluate_expression(expr: str, mode: str = "rad") -> float:
     if not expr or not expr.strip():
         raise ValueError("Empty expression")
     expr = expr.strip()
     try:
-        tree = ast.parse(expr, mode='eval')
+        tree = ast.parse(expr, mode="eval")
         visitor = SafeEvalVisitor(mode=mode)
         result = visitor.visit(tree)
         if not math.isfinite(result):

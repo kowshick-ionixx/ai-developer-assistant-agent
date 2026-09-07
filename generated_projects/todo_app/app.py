@@ -1,4 +1,5 @@
 import sqlite3
+
 import streamlit as st
 
 DB_FILE = "todos.db"
@@ -69,9 +70,7 @@ def main():
     for todo_id, task, completed in todos:
         col1, col2, col3 = st.columns([0.1, 0.7, 0.2])
         with col1:
-            is_checked = st.checkbox(
-                "", value=bool(completed), key=f"check_{todo_id}"
-            )
+            is_checked = st.checkbox("", value=bool(completed), key=f"check_{todo_id}")
             if is_checked != bool(completed):
                 toggle_todo(todo_id, is_checked)
                 st.rerun()

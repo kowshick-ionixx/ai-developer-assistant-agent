@@ -1,30 +1,47 @@
 import streamlit as st
+
 from calculator import (
-    add, subtract, multiply, divide, power, square_root,
-    factorial, sine, cosine, tangent, convert_temperature, convert_length
+    add,
+    convert_length,
+    convert_temperature,
+    cosine,
+    divide,
+    factorial,
+    multiply,
+    power,
+    sine,
+    square_root,
+    subtract,
+    tangent,
 )
 
 st.set_page_config(page_title="Advanced Calculator", page_icon="🧮", layout="centered")
 
 st.title("🧮 Advanced Calculator App")
-st.markdown("Perform basic arithmetic, advanced scientific calculations, and unit conversions.")
+st.markdown(
+    "Perform basic arithmetic, advanced scientific calculations, and unit conversions."
+)
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
-tab_basic, tab_scientific, tab_converter, tab_history = st.tabs([
-    "Basic Arithmetic", "Scientific", "Unit Converter", "History"
-])
+tab_basic, tab_scientific, tab_converter, tab_history = st.tabs(
+    ["Basic Arithmetic", "Scientific", "Unit Converter", "History"]
+)
 
 with tab_basic:
     st.header("Basic Operations")
     col1, col2, col3 = st.columns([3, 1, 3])
     with col1:
-        num1 = st.number_input("First Number", value=0.0, format="%.4f", key="basic_num1")
+        num1 = st.number_input(
+            "First Number", value=0.0, format="%.4f", key="basic_num1"
+        )
     with col2:
         op = st.selectbox("Operation", ["+", "-", "*", "/", "^"])
     with col3:
-        num2 = st.number_input("Second Number", value=0.0, format="%.4f", key="basic_num2")
+        num2 = st.number_input(
+            "Second Number", value=0.0, format="%.4f", key="basic_num2"
+        )
 
     if st.button("Calculate", key="calc_basic"):
         try:
@@ -38,7 +55,7 @@ with tab_basic:
                 res = divide(num1, num2)
             elif op == "^":
                 res = power(num1, num2)
-            
+
             st.success(f"Result: {res}")
             st.session_state.history.append(f"{num1} {op} {num2} = {res}")
         except Exception as e:
@@ -46,8 +63,10 @@ with tab_basic:
 
 with tab_scientific:
     st.header("Scientific Calculations")
-    sci_op = st.selectbox("Function", ["Square Root", "Factorial", "Sine", "Cosine", "Tangent"])
-    
+    sci_op = st.selectbox(
+        "Function", ["Square Root", "Factorial", "Sine", "Cosine", "Tangent"]
+    )
+
     if sci_op in ["Sine", "Cosine", "Tangent"]:
         angle_unit = st.radio("Angle Unit", ["degrees", "radians"])
     else:
@@ -83,7 +102,9 @@ with tab_converter:
     conv_type = st.selectbox("Conversion Type", ["Temperature", "Length"])
 
     if conv_type == "Temperature":
-        t_val = st.number_input("Temperature Value", value=0.0, format="%.2f", key="t_val")
+        t_val = st.number_input(
+            "Temperature Value", value=0.0, format="%.2f", key="t_val"
+        )
         t_from = st.selectbox("From", ["Celsius", "Fahrenheit", "Kelvin"], key="t_from")
         t_to = st.selectbox("To", ["Celsius", "Fahrenheit", "Kelvin"], key="t_to")
 
@@ -97,7 +118,15 @@ with tab_converter:
 
     elif conv_type == "Length":
         l_val = st.number_input("Length Value", value=0.0, format="%.4f", key="l_val")
-        units = ["Meters", "Kilometers", "Centimeters", "Millimeters", "Miles", "Feet", "Inches"]
+        units = [
+            "Meters",
+            "Kilometers",
+            "Centimeters",
+            "Millimeters",
+            "Miles",
+            "Feet",
+            "Inches",
+        ]
         l_from = st.selectbox("From", units, key="l_from")
         l_to = st.selectbox("To", units, key="l_to")
 

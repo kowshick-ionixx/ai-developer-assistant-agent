@@ -9,9 +9,7 @@ from database import (
     init_db,
 )
 
-st.set_page_config(
-    page_title="Student Grade Management", page_icon="🎓", layout="wide"
-)
+st.set_page_config(page_title="Student Grade Management", page_icon="🎓", layout="wide")
 
 init_db()
 

@@ -1,5 +1,6 @@
 import math
 
+
 class AdvancedCalculator:
     @staticmethod
     def add(a: float, b: float) -> float:
@@ -21,12 +22,14 @@ class AdvancedCalculator:
 
     @staticmethod
     def power(base: float, exp: float) -> float:
-        return base ** exp
+        return base**exp
 
     @staticmethod
     def square_root(a: float) -> float:
         if a < 0:
-            raise ValueError("Square root of negative number is not supported in real domain.")
+            raise ValueError(
+                "Square root of negative number is not supported in real domain."
+            )
         return math.sqrt(a)
 
     @staticmethod
@@ -59,7 +62,9 @@ class AdvancedCalculator:
         return math.factorial(n)
 
     @staticmethod
-    def convert_units(value: float, category: str, from_unit: str, to_unit: str) -> float:
+    def convert_units(
+        value: float, category: str, from_unit: str, to_unit: str
+    ) -> float:
         length_to_m = {
             "meters": 1.0,
             "kilometers": 1000.0,
@@ -67,25 +72,25 @@ class AdvancedCalculator:
             "millimeters": 0.001,
             "miles": 1609.34,
             "feet": 0.3048,
-            "inches": 0.0254
+            "inches": 0.0254,
         }
-        
+
         if category == "Temperature":
             if from_unit == to_unit:
                 return value
             if from_unit == "Celsius":
                 c = value
             elif from_unit == "Fahrenheit":
-                c = (value - 32) * 5/9
+                c = (value - 32) * 5 / 9
             elif from_unit == "Kelvin":
                 c = value - 273.15
             else:
                 raise ValueError(f"Unknown unit: {from_unit}")
-            
+
             if to_unit == "Celsius":
                 return c
             elif to_unit == "Fahrenheit":
-                return c * 9/5 + 32
+                return c * 9 / 5 + 32
             elif to_unit == "Kelvin":
                 return c + 273.15
             else:
