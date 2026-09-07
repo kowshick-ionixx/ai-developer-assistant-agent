@@ -41,6 +41,23 @@ def _make_pdf_bytes(num_pages: int = 1) -> bytes:
     return buffer.getvalue()
 
 
+def _make_pdf_with_real_text(page_texts: list[str]) -> bytes:
+    """A real, valid PDF with distinct real text on each page - built with
+    ReportLab (already a project dependency for tools.create_pdf) so PDF
+    extraction can be tested against genuine multi-page text content, not
+    just blank pages."""
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas
+
+    buffer = io.BytesIO()
+    pdf_canvas = canvas.Canvas(buffer, pagesize=LETTER)
+    for text in page_texts:
+        pdf_canvas.drawString(72, 700, text)
+        pdf_canvas.showPage()
+    pdf_canvas.save()
+    return buffer.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # validate_upload: file type / size / name
 # ---------------------------------------------------------------------------
@@ -164,6 +181,23 @@ def test_process_upload_pdf_with_no_extractable_text_reports_clear_error():
     result = process_upload("blank.pdf", _make_pdf_bytes())
     assert "error" in result
     assert "no readable text" in result["error"].lower()
+
+
+def test_process_upload_extracts_real_text_from_a_multi_page_pdf():
+    """Workflow 1 (PDF specification -> application) depends on this: a real
+    multi-page specification PDF's text must actually be extracted from
+    EVERY page, in order, not just the first."""
+    raw = _make_pdf_with_real_text(
+        [
+            "Todo App Project Specification - Page One - Project Overview",
+            "Todo App Project Specification - Page Two - Functional Requirements",
+        ]
+    )
+    result = process_upload("todo_spec.pdf", raw)
+    assert "error" not in result
+    assert "Page One - Project Overview" in result["content"]
+    assert "Page Two - Functional Requirements" in result["content"]
+    assert result["content"].index("Page One") < result["content"].index("Page Two")
 
 
 def test_process_upload_rejects_corrupted_pdf():

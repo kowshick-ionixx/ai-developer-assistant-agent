@@ -18,6 +18,9 @@ __pycache__/
 # Generated project packages (Phase 6 create_project_zip / Download ZIP)
 dist/
 
+# Generated PDF documents (create_pdf / Download PDF)
+generated_files/
+
 # generated_projects/ (New Application Generation, Phase 6) is deliberately
 # NOT ignored here - unlike dist/'s disposable build output, it holds the
 # actual generated application source code, which is real, human-approved

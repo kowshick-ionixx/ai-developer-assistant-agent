@@ -50,7 +50,7 @@ def apptest_with_mocked_agent(monkeypatch):
 
     monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
 
-    def fake_run_agent_turn(agent, history):
+    def fake_run_agent_turn(agent, history, **kwargs):
         last = history[-1]
         text = getattr(last, "content", str(last))
         return {"answer": f"MOCKED REPLY for: {text[:200]}", "tool_calls": []}
@@ -619,7 +619,7 @@ def test_approving_does_not_write_files_run_tests_or_call_the_agent(monkeypatch)
     monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyD-fake1234567890abcdefghijklmno")
     call_count = {"n": 0}
 
-    def counting_run_agent_turn(agent, history):
+    def counting_run_agent_turn(agent, history, **kwargs):
         call_count["n"] += 1
         return {"answer": "MOCKED", "tool_calls": []}
 
@@ -875,7 +875,7 @@ def test_workflow_states_are_displayed_when_present(
 
     import agent as agent_module
 
-    def fake_run_agent_turn_with_workflow(agent, history):
+    def fake_run_agent_turn_with_workflow(agent, history, **kwargs):
         return {
             "answer": "Done.",
             "tool_calls": [],
@@ -943,7 +943,7 @@ def test_apply_button_resumes_the_workflow_with_full_details(
 
     calls = []
 
-    def fake_run_agent_turn_resuming(agent, history):
+    def fake_run_agent_turn_resuming(agent, history, **kwargs):
         calls.append(history[-1].content)
         return {
             "answer": "Applied the change and all tests pass.",
@@ -1000,7 +1000,7 @@ def test_applied_change_disappears_from_pending_and_cannot_be_reapproved(
 
     import agent as agent_module
 
-    def fake_run_agent_turn_reports(agent, history):
+    def fake_run_agent_turn_reports(agent, history, **kwargs):
         return {
             "answer": "All tests pass.",
             "tool_calls": [],
@@ -1085,7 +1085,7 @@ def _set_completed_workflow(agent_module, monkeypatch, *, tests_passed: bool = T
     exit_code = 0 if tests_passed else 1
     states = ["TESTING", "REVIEWING"] + (["COMPLETED"] if tests_passed else ["FAILED"])
 
-    def fake_run_agent_turn(agent, history):
+    def fake_run_agent_turn(agent, history, **kwargs):
         return {
             "answer": "All done.",
             "tool_calls": [
@@ -1250,6 +1250,360 @@ def test_repeated_rerun_after_completion_does_not_rebuild_the_archive(
 
 
 # ---------------------------------------------------------------------------
+# create_pdf / the "Download PDF" button - rendered inline for the turn's
+# own create_pdf tool call (unlike the ZIP button, this is never gated on
+# the COMPLETED workflow state - a PDF request is a single-tool-call turn).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_generated_files_dir():
+    import tools
+
+    output_dir = tools.PROJECT_ROOT / "generated_files"
+
+    def _clear():
+        if output_dir.exists():
+            for entry in output_dir.iterdir():
+                if entry.is_file():
+                    entry.unlink()
+
+    _clear()
+    yield
+    _clear()
+
+
+def _set_pdf_tool_call(agent_module, monkeypatch, tool_output: str):
+    def fake_run_agent_turn(agent, history, **kwargs):
+        return {
+            "answer": "Here is your PDF.",
+            "tool_calls": [
+                {
+                    "name": "create_pdf",
+                    "input": {"title": "Python Basics"},
+                    "output": tool_output,
+                }
+            ],
+            "workflow_states": ["PACKAGING"],
+        }
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn)
+
+
+def test_pdf_download_button_appears_after_successful_create_pdf_call(
+    apptest_with_mocked_agent, monkeypatch
+):
+    import agent as agent_module
+    import tools
+
+    real_result = tools.create_pdf.invoke(
+        {"title": "Python Basics", "content": "# Intro\nPython is great.\n"}
+    )
+    _set_pdf_tool_call(agent_module, monkeypatch, real_result)
+
+    at = apptest_with_mocked_agent
+    at.chat_input[0].set_value("Create a PDF for Python basics").run(timeout=30)
+    assert at.exception == []
+
+    download_buttons = [
+        b for b in at.download_button if b.key and b.key.startswith("download_pdf_")
+    ]
+    assert len(download_buttons) == 1
+
+
+def test_pdf_download_button_serves_the_real_bytes_from_disk(
+    apptest_with_mocked_agent, monkeypatch
+):
+    """Regression coverage for the actual download mechanism, not just the
+    button's presence: create_pdf's reported path must point at a real,
+    non-empty, valid PDF file - the exact file _render_pdf_download reads
+    to build the button (AppTest's DownloadButton element does not expose
+    the bytes handed to st.download_button directly - see the file-level
+    check here, and test_download_button_serves_the_real_valid_archive_
+    from_disk above for the same pattern used with the ZIP button)."""
+    import agent as agent_module
+    import tools
+
+    real_result = tools.create_pdf.invoke(
+        {"title": "Python Basics", "content": "# Intro\nPython is great.\n"}
+    )
+    rel_path = re.search(r"^Path:\s*(\S+)\s*$", real_result, flags=re.MULTILINE).group(
+        1
+    )
+    on_disk = tools.PROJECT_ROOT / rel_path
+    _set_pdf_tool_call(agent_module, monkeypatch, real_result)
+
+    at = apptest_with_mocked_agent
+    at.chat_input[0].set_value("Create a PDF for Python basics").run(timeout=30)
+    assert at.exception == []
+
+    download_buttons = [
+        b for b in at.download_button if b.key and b.key.startswith("download_pdf_")
+    ]
+    assert len(download_buttons) == 1
+    assert download_buttons[0].label == "📄 Download PDF"
+    assert on_disk.is_file()
+    assert on_disk.read_bytes().startswith(b"%PDF")
+
+
+def test_pdf_download_button_absent_when_create_pdf_failed(
+    apptest_with_mocked_agent, monkeypatch
+):
+    import agent as agent_module
+
+    _set_pdf_tool_call(
+        agent_module,
+        monkeypatch,
+        "Error: no content was provided to build the PDF from.",
+    )
+
+    at = apptest_with_mocked_agent
+    at.chat_input[0].set_value("Create a PDF for Python basics").run(timeout=30)
+    assert at.exception == []
+
+    download_buttons = [
+        b for b in at.download_button if b.key and b.key.startswith("download_pdf_")
+    ]
+    assert download_buttons == []
+
+
+def test_pdf_download_button_absent_before_any_pdf_request(apptest_with_mocked_agent):
+    at = apptest_with_mocked_agent
+    download_buttons = [
+        b for b in at.download_button if b.key and b.key.startswith("download_pdf_")
+    ]
+    assert download_buttons == []
+
+
+# ---------------------------------------------------------------------------
+# Workflows 1-3: the ACTIVE GENERATED PROJECT hint (so "create documentation
+# PDF for this application" never depends on the model recalling a folder
+# name), and the task_wants_documentation flag that lets a single combined
+# request ("build the app ..., test it, and create documentation PDF")
+# survive the human-approval pause between propose and apply.
+# ---------------------------------------------------------------------------
+
+
+def test_active_project_hint_included_when_a_project_is_active(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+    at.session_state["active_project_path"] = "generated_projects/todo_app"
+
+    import agent as agent_module
+
+    captured = []
+
+    def fake_run_agent_turn(agent, history, **kwargs):
+        captured.append(history[-1].content)
+        return {"answer": "ok", "tool_calls": [], "workflow_states": []}
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn)
+
+    at.chat_input[0].set_value("Create a documentation PDF for this application.").run(
+        timeout=30
+    )
+    assert at.exception == []
+
+    assert captured
+    assert "ACTIVE GENERATED PROJECT: generated_projects/todo_app" in captured[-1]
+
+
+def test_active_project_hint_absent_when_no_project_generated_yet(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+    assert at.session_state["active_project_path"] is None
+
+    import agent as agent_module
+
+    captured = []
+
+    def fake_run_agent_turn(agent, history, **kwargs):
+        captured.append(history[-1].content)
+        return {"answer": "ok", "tool_calls": [], "workflow_states": []}
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn)
+
+    at.chat_input[0].set_value("What is a REST API?").run(timeout=30)
+    assert at.exception == []
+
+    assert captured
+    assert "ACTIVE GENERATED PROJECT" not in captured[-1]
+
+
+def test_task_wants_documentation_flag_set_from_combined_request(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+
+    monkeypatch.setattr(
+        agent_module,
+        "run_agent_turn",
+        lambda agent, history, **kwargs: {
+            "answer": "ok",
+            "tool_calls": [],
+            "workflow_states": [],
+        },
+    )
+
+    at.chat_input[0].set_value(
+        "Create a Python Todo app and generate a PDF documentation for the project."
+    ).run(timeout=30)
+    assert at.exception == []
+    assert at.session_state["task_wants_documentation"] is True
+
+
+def test_task_wants_documentation_flag_false_for_plain_pdf_spec_build(
+    apptest_with_mocked_agent, monkeypatch
+):
+    """A PDF-specification-driven build ("build the app from this PDF")
+    mentions "PDF" only as the SOURCE of the requirements - it must not, by
+    itself, set the documentation-continuation flag."""
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+
+    monkeypatch.setattr(
+        agent_module,
+        "run_agent_turn",
+        lambda agent, history, **kwargs: {
+            "answer": "ok",
+            "tool_calls": [],
+            "workflow_states": [],
+        },
+    )
+
+    at.chat_input[0].set_value("Build the application based on this PDF.").run(
+        timeout=30
+    )
+    assert at.exception == []
+    assert at.session_state["task_wants_documentation"] is False
+
+
+def test_also_generate_documentation_passed_through_to_run_agent_turn(
+    apptest_with_mocked_agent, monkeypatch
+):
+    at = apptest_with_mocked_agent
+    import agent as agent_module
+
+    captured_kwargs = []
+
+    def fake_run_agent_turn(agent, history, **kwargs):
+        captured_kwargs.append(kwargs)
+        return {"answer": "ok", "tool_calls": [], "workflow_states": []}
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn)
+
+    at.chat_input[0].set_value(
+        "Create a Todo app and generate documentation PDF for it."
+    ).run(timeout=30)
+    assert at.exception == []
+    assert captured_kwargs[-1].get("also_generate_documentation") is True
+
+
+def test_apply_resume_nudge_mentions_documentation_when_task_wants_it(
+    apptest_with_mocked_agent, monkeypatch, _apply_scratch_files
+):
+    """The core Workflow 3 regression test: task_wants_documentation set on
+    the original request must still be honored after the human-approval
+    pause (Approve, then Apply) - the resume nudge sent to run_agent_turn
+    must explicitly ask for the documentation PDF too."""
+    at = apptest_with_mocked_agent
+    path = _apply_scratch_files("tests/_phase6_ui_scratch_doc_resume.py")
+
+    import agent as agent_module
+
+    at.session_state["task_wants_documentation"] = True
+
+    calls = []
+
+    def fake_run_agent_turn_resuming(agent, history, **kwargs):
+        calls.append(history[-1].content)
+        return {
+            "answer": "Applied the change, tests pass, and documentation PDF created.",
+            "tool_calls": [],
+            "workflow_states": ["IMPLEMENTING", "TESTING", "REVIEWING", "COMPLETED"],
+        }
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn_resuming)
+
+    change = workflow.register_change(
+        file_path=path, action="create", content="x = 1\n", reason="demo"
+    )
+    workflow._pending_changes.pop(change.change_id)
+    change.change_id = "docresume1"
+    workflow._pending_changes["docresume1"] = change
+
+    at = _goto(at, "Changes")
+    approve_btn = next(
+        b for b in at.button if b.key == f"approve_set_{change.changeset_id}"
+    )
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    apply_btn = next(
+        b for b in at.button if b.key == f"apply_set_{change.changeset_id}"
+    )
+    apply_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert calls, "run_agent_turn should have been called to resume the workflow"
+    assert "documentation PDF" in calls[-1]
+    assert "create_pdf" in calls[-1]
+
+
+def test_apply_resume_nudge_omits_documentation_clause_when_not_requested(
+    apptest_with_mocked_agent, monkeypatch, _apply_scratch_files
+):
+    at = apptest_with_mocked_agent
+    path = _apply_scratch_files("tests/_phase6_ui_scratch_no_doc_resume.py")
+
+    import agent as agent_module
+
+    at.session_state["task_wants_documentation"] = False
+
+    calls = []
+
+    def fake_run_agent_turn_resuming(agent, history, **kwargs):
+        calls.append(history[-1].content)
+        return {
+            "answer": "Applied the change and all tests pass.",
+            "tool_calls": [],
+            "workflow_states": ["IMPLEMENTING", "TESTING", "REVIEWING", "COMPLETED"],
+        }
+
+    monkeypatch.setattr(agent_module, "run_agent_turn", fake_run_agent_turn_resuming)
+
+    change = workflow.register_change(
+        file_path=path, action="create", content="x = 1\n", reason="demo"
+    )
+    workflow._pending_changes.pop(change.change_id)
+    change.change_id = "nodocresume1"
+    workflow._pending_changes["nodocresume1"] = change
+
+    at = _goto(at, "Changes")
+    approve_btn = next(
+        b for b in at.button if b.key == f"approve_set_{change.changeset_id}"
+    )
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    apply_btn = next(
+        b for b in at.button if b.key == f"apply_set_{change.changeset_id}"
+    )
+    apply_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    assert calls
+    assert "documentation PDF" not in calls[-1]
+
+
+# ---------------------------------------------------------------------------
 # Phase 6: Live Application Preview (launch_generated_app/stop_generated_app)
 # - the "🚀 Live Application" section and its Start/Stop buttons.
 # ---------------------------------------------------------------------------
@@ -1300,7 +1654,7 @@ def _set_generated_app_verified(agent_module, monkeypatch, change_id: str) -> No
     call for the generated file, and a run_pytest call whose `target`
     targets that exact generated project, with a genuine passing exit code."""
 
-    def fake_run_agent_turn(agent, history):
+    def fake_run_agent_turn(agent, history, **kwargs):
         return {
             "answer": "Done.",
             "tool_calls": [
@@ -1573,7 +1927,7 @@ def test_zip_scopes_to_generated_project_when_applied_via_apply_button(
         reason="generated app (test)",
     )
 
-    def fake_run_agent_turn_after_apply(agent, history):
+    def fake_run_agent_turn_after_apply(agent, history, **kwargs):
         return {
             "answer": "Tests pass.",
             "tool_calls": [

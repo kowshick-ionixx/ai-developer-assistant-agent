@@ -35,6 +35,7 @@ from agent import (
     describe_agent_error,
     get_api_key,
     get_model_name,
+    mentions_documentation_request,
     new_ai_message,
     new_human_message,
     run_agent_turn,
@@ -322,6 +323,7 @@ TOOL_DISPLAY_NAMES = {
     "create_project_zip": "📦 Packaging Project",
     "launch_generated_app": "🚀 Launching Generated Application",
     "stop_generated_app": "🛑 Stopping Generated Application",
+    "create_pdf": "📄 Generating PDF",
 }
 
 # "Execution Plan" list: what a turn's tool calls actually did, in order -
@@ -351,6 +353,7 @@ EXECUTION_STEP_LABELS = {
     "create_project_zip": "Package the project into a ZIP",
     "launch_generated_app": "Launch the generated application live",
     "stop_generated_app": "Stop the generated application",
+    "create_pdf": "Generate a PDF document",
 }
 
 # Compact 7-step task strip (Chat page). Each step's "done" state is derived
@@ -552,8 +555,51 @@ def render_execution_plan(tool_calls: list[dict]) -> None:
             st.markdown(f"{index}. {html.escape(step)} ✓")
 
 
-def render_tool_box(tool_call: dict) -> None:
-    """Render a single 'Using X' note for one tool call."""
+_PDF_PATH_RE = re.compile(r"(?m)^Path:\s*(\S+)\s*$")
+
+
+def _render_pdf_download(tool_call: dict, key: str) -> None:
+    """Show a real 'Download PDF' button for a create_pdf tool call - reads
+    the actual bytes of the file create_pdf reported it wrote (never a fake
+    link), and shows nothing at all if create_pdf did not report a real
+    "Path: ..." line (e.g. because generation failed, in which case its
+    output starts with "Error: ..." and never matches _PDF_PATH_RE)."""
+    output = str(tool_call.get("output", ""))
+    match = _PDF_PATH_RE.search(output)
+    if not match:
+        return
+
+    safe_path = tools.get_generated_pdf_path(match.group(1))
+    if safe_path is None:
+        st.caption("⚠️ This PDF is no longer available on disk.")
+        return
+
+    try:
+        pdf_bytes = safe_path.read_bytes()
+    except OSError as exc:
+        log_error("render_pdf_download", exc)
+        st.caption("⚠️ This PDF is no longer available on disk.")
+        return
+
+    st.success(f"✅ PDF created successfully — **{safe_path.name}**")
+    st.download_button(
+        "📄 Download PDF",
+        data=pdf_bytes,
+        file_name=safe_path.name,
+        mime="application/pdf",
+        use_container_width=True,
+        key=f"download_pdf_{key}",
+    )
+
+
+def render_tool_box(tool_call: dict, key: str = "") -> None:
+    """Render a single 'Using X' note for one tool call. `key` must be a
+    value unique within this script run whenever the tool call may render
+    an interactive widget (currently only create_pdf's download button) -
+    Streamlit requires a unique key for every widget, and the same tool
+    call is re-rendered on every later rerun once it's part of chat
+    history, so callers must pass a stable-but-unique key (see the two call
+    sites in _run_and_render_turn/render_chat_page)."""
     name = tool_call["name"]
     header = TOOL_DISPLAY_NAMES.get(name, f"🔧 Using {name}")
 
@@ -571,6 +617,11 @@ def render_tool_box(tool_call: dict) -> None:
     elif name == "apply_approved_change":
         change_id = tool_call["input"].get("change_id", "")
         body = f"**Change ID:** `{change_id}`<br>{_output_block(tool_call['output'])}"
+    elif name == "create_pdf":
+        title = tool_call["input"].get("title", "")
+        body = (
+            f"**Topic:** `{html.escape(title)}`<br>{_output_block(tool_call['output'])}"
+        )
     else:
         body = _output_block(tool_call["output"])
 
@@ -579,6 +630,9 @@ def render_tool_box(tool_call: dict) -> None:
         f"<b>{header}</b><br>{body}</div>",
         unsafe_allow_html=True,
     )
+
+    if name == "create_pdf":
+        _render_pdf_download(tool_call, key)
 
 
 def _run_and_render_turn(
@@ -613,7 +667,11 @@ def _run_and_render_turn(
         turn_started_at = time.time()
         with st.spinner(spinner_text):
             try:
-                result = run_agent_turn(agent, st.session_state.lc_history)
+                result = run_agent_turn(
+                    agent,
+                    st.session_state.lc_history,
+                    also_generate_documentation=st.session_state.task_wants_documentation,
+                )
                 answer = result["answer"]
                 tool_calls = result["tool_calls"]
                 workflow_states = result.get("workflow_states", [])
@@ -624,12 +682,12 @@ def _run_and_render_turn(
                 workflow_states = []
         turn_duration = time.time() - turn_started_at
 
-        for tool_call in tool_calls:
-            render_tool_box(tool_call)
+        for position, tool_call in enumerate(tool_calls):
+            render_tool_box(
+                tool_call, key=f"live_{len(st.session_state.messages)}_{position}"
+            )
             if tool_call.get("name") == "apply_approved_change":
-                _note_applied_change(
-                    tool_call.get("input", {}).get("change_id", "")
-                )
+                _note_applied_change(tool_call.get("input", {}).get("change_id", ""))
 
         render_answer(answer)
         render_workflow_states(workflow_states)
@@ -738,6 +796,17 @@ def _apply_changeset_and_resume(agent, changeset_id: str) -> None:
         "the existing Phase 6 workflow (regression testing, Ruff, Black, final "
         "verification). Finish with a concise summary."
     )
+    if st.session_state.task_wants_documentation:
+        # The original request that started this task also asked for a
+        # documentation PDF (see mentions_documentation_request) - carry that
+        # intent across this human-approval pause explicitly, rather than
+        # relying only on run_agent_turn's own auto-continue nudge later.
+        nudge += (
+            " The original request also asked for a documentation PDF - once the "
+            "application's tests are passing, inspect the actual generated project's "
+            "real files and call create_pdf to generate that documentation PDF too, "
+            "before finishing."
+        )
     _run_and_render_turn(agent, summary, nudge, spinner_text="Applying and testing...")
     st.rerun()
 
@@ -1178,6 +1247,18 @@ if "active_project_path" not in st.session_state:
     # yet this session.
     st.session_state.active_project_path = None
 
+if "task_wants_documentation" not in st.session_state:
+    # Whether the CURRENT Phase 6 task's original request also asked for a
+    # documentation PDF (see agent.mentions_documentation_request) - e.g.
+    # "build the app from this PDF, test it, and create documentation PDF".
+    # Recomputed only when a genuinely NEW task starts (no changeset
+    # currently pending - see render_chat_page), so it survives the
+    # human-approval pause between propose and apply for the SAME task
+    # without leaking into an unrelated later one. Read by
+    # _run_and_render_turn (passed to run_agent_turn's
+    # also_generate_documentation) and _apply_changeset_and_resume's nudge.
+    st.session_state.task_wants_documentation = False
+
 if "project_tree_cache" not in st.session_state:
     st.session_state.project_tree_cache = None
 
@@ -1403,8 +1484,8 @@ def render_chat_page() -> None:
     last_message_index = len(st.session_state.messages) - 1
     for index, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
-            for tool_call in message.get("tool_calls", []):
-                render_tool_box(tool_call)
+            for position, tool_call in enumerate(message.get("tool_calls", [])):
+                render_tool_box(tool_call, key=f"history_{index}_{position}")
             if message["role"] == "assistant":
                 render_answer(message["content"])
                 render_workflow_states(message.get("workflow_states", []))
@@ -1494,10 +1575,28 @@ def render_chat_page() -> None:
         user_input = user_input.strip()
 
     if user_input:
+        # Only recompute for a genuinely NEW task (no changeset currently
+        # pending) - a follow-up message mid-task (e.g. while waiting for
+        # approval) must not overwrite the original task's own intent. See
+        # the task_wants_documentation session-state entry's own comment.
+        if workflow.get_current_changeset_id() is None:
+            st.session_state.task_wants_documentation = mentions_documentation_request(
+                user_input
+            )
+
         # The chat displays what the user actually typed/said; the agent
         # additionally receives any attached-document context, clearly
-        # labeled as untrusted reference data.
+        # labeled as untrusted reference data, plus a deterministic hint
+        # naming the currently active generated project (if any) so a
+        # follow-up like "create a documentation PDF for this application"
+        # never depends on the model recalling a folder name from earlier
+        # scrollback.
         agent_input = user_input
+        if st.session_state.active_project_path:
+            agent_input = (
+                f"ACTIVE GENERATED PROJECT: {st.session_state.active_project_path}\n\n"
+                f"{agent_input}"
+            )
         document_block = documents.build_document_context_block(
             st.session_state.attached_files
         )

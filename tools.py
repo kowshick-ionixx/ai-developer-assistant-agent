@@ -31,6 +31,7 @@ This file defines twenty-four tools:
     22. create_project_zip    -> (Phase 6) packages this project's real current files into a ZIP
     23. launch_generated_app  -> (Phase 6) starts a generated Streamlit app as its own local server
     24. stop_generated_app    -> (Phase 6) stops a generated app's server started by tool 23
+    25. create_pdf            -> generates a real PDF document from LLM-authored content
 
 Code generation, debugging, review, and refactoring are handled by Gemini's
 own reasoning (guided by the system prompt in agent.py) rather than by tools
@@ -212,10 +213,42 @@ preview of a generated application):
       launched it (see _rehydrate_tracked_server). That file is only ever
       a hint - it is re-verified with a REAL health check before ever
       being trusted, and is removed the moment it's found to be stale.
+
+Safety notes for create_pdf:
+    - Writes ONLY inside this project's own "generated_files/" folder
+      (created if needed) - never anywhere else on disk. The filename is
+      always derived by sanitizing free-form text (title or an optional
+      caller-supplied name) down to lowercase letters/digits/underscores
+      only, the same technique create_project_zip's _zip_safe_name already
+      uses - there is no way for a path separator, "..", or another drive
+      to reach the filesystem, and the final resolved path is still
+      re-checked against PROJECT_ROOT before every write (defense in
+      depth, the same relative_to() escape check every other file-writing
+      tool in this module uses).
+    - Never overwrites an unrelated existing PDF: if the sanitized filename
+      already exists in "generated_files/", a timestamp is appended to the
+      new file's name instead of silently replacing the old one.
+    - Content is only ever placed into the PDF as escaped text (never
+      interpreted as ReportLab's own mini-markup or raw HTML) - a small,
+      fixed subset of Markdown (#/##/### headings, blank-line-separated
+      paragraphs, "- "/"* " bullets, fenced ``` code blocks) is parsed
+      structurally first, then every piece of text is HTML-escaped before
+      being handed to ReportLab, so LLM-authored content can never break
+      out of its paragraph/heading/code styling or inject arbitrary markup.
+    - Real verification, not a claimed success: the tool only reports
+      success after the PDF bytes actually start with the real PDF magic
+      header (b"%PDF"), the file was actually written to disk, and it
+      actually has a non-zero size - never a fabricated "created" message.
+    - Handles a missing ReportLab install, empty/oversized content, and any
+      filesystem/permission error with a clear, user-friendly message
+      ("PDF generation failed. Please try again.") while the specific
+      underlying error is only ever logged internally (see logger.log_error)
+      - never included in the message shown to the user.
 """
 
 import ast
 import hashlib
+import html
 import io
 import json
 import operator
@@ -329,6 +362,12 @@ _EXCLUDED_DIR_NAMES = {
     ".mypy_cache",
     "node_modules",
 }
+
+# Where create_pdf (Tool 25) writes generated PDF documents - defined here
+# (rather than down near that tool) so _ZIP_EXTRA_EXCLUDED_DIR_NAMES below
+# can exclude it from create_project_zip's whole-project archive the same
+# way "dist/" is excluded: generated output, never source.
+_PDF_OUTPUT_DIRNAME = "generated_files"
 
 # Files that must never be read or searched, even though they live inside
 # the project root and would otherwise pass the path-safety check below.
@@ -2153,7 +2192,10 @@ def list_pending_changes() -> str:
 # ---------------------------------------------------------------------------
 
 _ZIP_OUTPUT_DIRNAME = "dist"
-_ZIP_EXTRA_EXCLUDED_DIR_NAMES = _EXCLUDED_DIR_NAMES | {_ZIP_OUTPUT_DIRNAME}
+_ZIP_EXTRA_EXCLUDED_DIR_NAMES = _EXCLUDED_DIR_NAMES | {
+    _ZIP_OUTPUT_DIRNAME,
+    _PDF_OUTPUT_DIRNAME,
+}
 _ZIP_SECRET_SCAN_MAX_BYTES = _MAX_FILE_READ_BYTES
 _ZIP_NAME_RE = re.compile(r"[^a-z0-9]+")
 
@@ -3068,5 +3110,385 @@ def stop_generated_app(project_root: str) -> str:
 
     result = f"Stopped the generated application at '{project_root}'."
     log_tool_execution("Generated application stopped.")
+    log_tool_result(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 25: PDF generation (create_pdf). See the module docstring's "Safety
+# notes for create_pdf" section above for the full policy.
+# ---------------------------------------------------------------------------
+
+_MAX_PDF_CONTENT_CHARS = 60_000
+_PDF_HEADING_RE = re.compile(r"^(#{1,3})\s+(.*)$")
+_PDF_BULLET_RE = re.compile(r"^[-*]\s+(.*)$")
+_PDF_FENCE_RE = re.compile(r"^```")
+
+
+def _pdf_safe_filename(name: str) -> str:
+    """Reduce free-form text (a title, or an optional caller-supplied name)
+    to a safe ".pdf" filename - reuses create_project_zip's exact
+    sanitization rule (_ZIP_NAME_RE: lowercase, every non [a-z0-9] run
+    collapsed to one underscore, trimmed, capped at 60 chars) so there is no
+    way for a path separator, "..", or another drive to reach the
+    filesystem. Falls back to "document" only when nothing usable remains."""
+    cleaned = _ZIP_NAME_RE.sub("_", (name or "").strip().lower()).strip("_")
+    base = cleaned[:60] or "document"
+    return f"{base}.pdf"
+
+
+def _parse_pdf_markdown(content: str) -> list[tuple[str, str]]:
+    """Parse a small, fixed subset of Markdown - "#"/"##"/"###" headings,
+    blank-line-separated paragraphs, "-"/"*" bullet points, and fenced
+    ``` code blocks - into an ordered list of (block_type, text) tuples
+    ("heading1"/"heading2"/"heading3"/"paragraph"/"bullet"/"code").
+
+    Deliberately simple (not a general Markdown parser): this only needs to
+    recognize the same handful of block shapes the LLM is instructed to
+    write content in, so _build_pdf_bytes can lay each one out with its own
+    PDF style. Any line that doesn't match a special form is treated as
+    paragraph text.
+    """
+    lines = content.splitlines()
+    blocks: list[tuple[str, str]] = []
+    paragraph_buf: list[str] = []
+
+    def flush_paragraph() -> None:
+        if paragraph_buf:
+            text = " ".join(paragraph_buf).strip()
+            if text:
+                blocks.append(("paragraph", text))
+            paragraph_buf.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if _PDF_FENCE_RE.match(stripped):
+            flush_paragraph()
+            code_lines: list[str] = []
+            i += 1
+            while i < len(lines) and not _PDF_FENCE_RE.match(lines[i].strip()):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip the closing fence (or end of content, if unclosed)
+            blocks.append(("code", "\n".join(code_lines).strip("\n")))
+            continue
+
+        heading_match = _PDF_HEADING_RE.match(line)
+        if heading_match:
+            flush_paragraph()
+            level = len(heading_match.group(1))
+            blocks.append((f"heading{level}", heading_match.group(2).strip()))
+            i += 1
+            continue
+
+        bullet_match = _PDF_BULLET_RE.match(line)
+        if bullet_match:
+            flush_paragraph()
+            blocks.append(("bullet", bullet_match.group(1).strip()))
+            i += 1
+            continue
+
+        if not stripped:
+            flush_paragraph()
+            i += 1
+            continue
+
+        paragraph_buf.append(stripped)
+        i += 1
+
+    flush_paragraph()
+    return blocks
+
+
+def _build_pdf_bytes(title: str, content: str) -> bytes:
+    """Render `title` + `content` (parsed via _parse_pdf_markdown) into a
+    real PDF document in memory using ReportLab, with reasonable margins,
+    heading/body/code styles, bullet lists, page breaks between very long
+    sections handled automatically by ReportLab's own flowable layout, and
+    a page number on every page.
+
+    Every piece of text is HTML-escaped before being wrapped in a
+    reportlab Paragraph - Paragraph text is interpreted as a small XML-like
+    markup, so raw LLM-authored text is never passed through unescaped
+    (defense against malformed or unexpected markup breaking the layout).
+
+    Raises ImportError if the 'reportlab' package is not installed - the
+    caller (create_pdf) turns that into a specific, friendly error message.
+    Any other failure propagates as-is for create_pdf to log and translate
+    into its generic "PDF generation failed" message.
+    """
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        ListFlowable,
+        ListItem,
+        Paragraph,
+        Preformatted,
+        SimpleDocTemplate,
+        Spacer,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PDFTitle", parent=styles["Title"], fontSize=22, leading=26, spaceAfter=18
+    )
+    heading_styles = {
+        "heading1": ParagraphStyle(
+            "PDFHeading1",
+            parent=styles["Heading1"],
+            fontSize=16,
+            spaceBefore=16,
+            spaceAfter=8,
+        ),
+        "heading2": ParagraphStyle(
+            "PDFHeading2",
+            parent=styles["Heading2"],
+            fontSize=13,
+            spaceBefore=12,
+            spaceAfter=6,
+        ),
+        "heading3": ParagraphStyle(
+            "PDFHeading3",
+            parent=styles["Heading3"],
+            fontSize=11.5,
+            spaceBefore=10,
+            spaceAfter=6,
+        ),
+    }
+    body_style = ParagraphStyle(
+        "PDFBody",
+        parent=styles["BodyText"],
+        fontSize=10.5,
+        leading=15,
+        spaceAfter=8,
+        alignment=TA_LEFT,
+    )
+    bullet_style = ParagraphStyle(
+        "PDFBullet", parent=body_style, leftIndent=14, spaceAfter=4
+    )
+    code_style = ParagraphStyle(
+        "PDFCode",
+        parent=styles["Code"],
+        fontName="Courier",
+        fontSize=9,
+        leading=12,
+        backColor="#f2f2f2",
+        borderPadding=6,
+        spaceBefore=6,
+        spaceAfter=10,
+    )
+
+    story = [Paragraph(html.escape(title), title_style), Spacer(1, 10)]
+    bullet_buf: list[str] = []
+
+    def flush_bullets() -> None:
+        if bullet_buf:
+            story.append(
+                ListFlowable(
+                    [
+                        ListItem(Paragraph(html.escape(item), bullet_style))
+                        for item in bullet_buf
+                    ],
+                    bulletType="bullet",
+                    leftIndent=16,
+                )
+            )
+            bullet_buf.clear()
+
+    for block_type, text in _parse_pdf_markdown(content):
+        if block_type == "bullet":
+            bullet_buf.append(text)
+            continue
+        flush_bullets()
+        if block_type in heading_styles:
+            story.append(Paragraph(html.escape(text), heading_styles[block_type]))
+        elif block_type == "code":
+            story.append(Preformatted(text, code_style))
+        elif text:
+            story.append(Paragraph(html.escape(text), body_style))
+    flush_bullets()
+
+    def _draw_page_number(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.drawRightString(LETTER[0] - 0.75 * inch, 0.5 * inch, f"Page {doc.page}")
+        canvas.restoreState()
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=LETTER,
+        leftMargin=0.9 * inch,
+        rightMargin=0.9 * inch,
+        topMargin=0.9 * inch,
+        bottomMargin=0.75 * inch,
+        title=title,
+    )
+    doc.build(story, onFirstPage=_draw_page_number, onLaterPages=_draw_page_number)
+    return buffer.getvalue()
+
+
+def _unique_pdf_path(base_filename: str) -> Path:
+    """Resolve `base_filename` (already sanitized by _pdf_safe_filename) to
+    a path inside this project's own "generated_files/" folder, never
+    anywhere else (the same relative_to() escape check every other
+    file-writing tool in this module uses - defense in depth on top of
+    _pdf_safe_filename already stripping every path-separator character).
+
+    If a file with that exact name already exists, a timestamp is appended
+    instead of overwriting it, so an earlier unrelated PDF (e.g. from a
+    previous, differently-worded request that sanitized to the same name)
+    is never silently replaced.
+    """
+    output_dir = PROJECT_ROOT / _PDF_OUTPUT_DIRNAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate = (output_dir / base_filename).resolve()
+    candidate.relative_to(PROJECT_ROOT)  # raises ValueError if this ever escaped
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(base_filename).stem or "document"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = (output_dir / f"{stem}_{timestamp}.pdf").resolve()
+    candidate.relative_to(PROJECT_ROOT)
+    return candidate
+
+
+def get_generated_pdf_path(rel_path: str) -> Path | None:
+    """Resolve a path create_pdf reported it wrote to a real file, for the
+    Streamlit UI's "Download PDF" button (called directly, never through
+    the agent). Never trusts the string alone: it must resolve inside this
+    project (the same _resolve_safe_path every file tool uses) AND actually
+    land inside "generated_files/" specifically, not merely somewhere in
+    the project - so even a corrupted or unexpected value can never be used
+    to read an arbitrary file. Returns None (never raises) unless the path
+    is safe and a real file currently exists there.
+    """
+    safe_path = _resolve_safe_path(rel_path)
+    if safe_path is None:
+        return None
+    try:
+        safe_path.relative_to(PROJECT_ROOT / _PDF_OUTPUT_DIRNAME)
+    except ValueError:
+        return None
+    if not safe_path.is_file():
+        return None
+    return safe_path
+
+
+@tool
+def create_pdf(title: str, content: str, filename: str = "") -> str:
+    """Generate a REAL, downloadable PDF document from content you write,
+    and save it inside this project's own "generated_files/" folder.
+
+    Use this whenever the user asks to CREATE A PDF or CREATE A DOCUMENT for
+    some topic - e.g. "create a PDF for Python basics", "create a document
+    for building a Todo app in Python", "create a PDF explaining REST
+    APIs", "create a document for my AI Developer Assistant project". Do
+    NOT use this for a plain explanation/question ("explain Python lists",
+    "what is a REST API?") - answer those directly in chat instead. There is
+    no other way to produce an actual downloadable PDF file - never claim
+    you cannot create or attach a PDF; this tool exists specifically for
+    that.
+
+    First write the real content yourself as Markdown in `content`:
+    "# "/"## "/"### " for section headings, blank-line-separated paragraphs,
+    "- "/"* " for bullet points, and fenced ``` code blocks for any code or
+    commands. Choose whatever sections genuinely fit the request (e.g.
+    Introduction/Concepts/Examples/Common Mistakes/Summary for an
+    educational topic; Overview/Requirements/Architecture/Implementation
+    Steps/Testing for a software-development guide) - never force an
+    irrelevant section.
+
+    `title` becomes the PDF's title (e.g. "Python Basics"). `filename` is
+    optional - a safe ".pdf" name is generated from `title` when omitted.
+    The file is always written only inside "generated_files/" with a
+    sanitized filename (no path separators, no "..", never another drive);
+    a name collision gets a timestamp suffix rather than overwriting an
+    earlier PDF.
+
+    Returns the real path that was actually written to disk on success, or
+    a clear "Error: ..." message otherwise - only ever after actually
+    verifying the file exists on disk. Never claim a PDF was created unless
+    this tool's own result says so.
+    """
+    log_tool_call("create_pdf")
+    title = (title or "").strip()
+    content = (content or "").strip()
+    filename = (filename or "").strip()
+    log_tool_input(
+        f"title={title!r} filename={filename or '(auto)'!r} "
+        f"content_length={len(content)}"
+    )
+
+    if not title:
+        result = "Error: no title was provided."
+        log_tool_result(result)
+        return result
+    if not content:
+        result = "Error: no content was provided to build the PDF from."
+        log_tool_result(result)
+        return result
+    if len(content) > _MAX_PDF_CONTENT_CHARS:
+        result = (
+            f"Error: content is too long to generate a PDF ({len(content)} "
+            f"characters, limit {_MAX_PDF_CONTENT_CHARS})."
+        )
+        log_tool_result(result)
+        return result
+
+    log_tool_execution("Building PDF document...")
+    try:
+        pdf_bytes = _build_pdf_bytes(title, content)
+    except ImportError as exc:
+        log_error("create_pdf", exc)
+        result = (
+            "Error: PDF generation is unavailable because the 'reportlab' "
+            "package is not installed."
+        )
+        log_tool_result(result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - never let a rendering bug crash the agent
+        log_error("create_pdf", exc)
+        result = "Error: PDF generation failed. Please try again."
+        log_tool_result(result)
+        return result
+
+    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
+        log_error("create_pdf", "generated bytes were not a valid PDF")
+        result = "Error: PDF generation failed. Please try again."
+        log_tool_result(result)
+        return result
+
+    base_filename = _pdf_safe_filename(Path(filename).stem if filename else title)
+    try:
+        target_path = _unique_pdf_path(base_filename)
+        target_path.write_bytes(pdf_bytes)
+    except (OSError, ValueError) as exc:
+        log_error("create_pdf", exc)
+        result = "Error: PDF generation failed. Please try again."
+        log_tool_result(result)
+        return result
+
+    if not target_path.is_file() or target_path.stat().st_size == 0:
+        log_error("create_pdf", "file was not actually written to disk")
+        result = "Error: PDF generation failed. Please try again."
+        log_tool_result(result)
+        return result
+
+    rel_path = target_path.relative_to(PROJECT_ROOT).as_posix()
+    result = (
+        "PDF created successfully.\n"
+        f"File: {target_path.name}\n"
+        f"Path: {rel_path}\n"
+        f"Size: {target_path.stat().st_size} bytes."
+    )
+    log_tool_execution("PDF created successfully.")
     log_tool_result(result)
     return result
