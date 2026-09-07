@@ -1,25 +1,22 @@
-# To-Do List App
+# Simple To-Do List Application
 
-A clean and intuitive To-Do List application built with Python and Streamlit.
+A simple To-Do List application built with Python, Streamlit, and SQLite, adhering to test requirements.
 
 ## Features
-- Add tasks with title and optional description
-- Mark tasks as complete or incomplete
-- Filter tasks by All, Active, or Completed
-- Delete individual tasks or clear all completed tasks
+- Add new tasks
+- View all tasks with status and creation date
+- Mark tasks as completed
+- Delete tasks
+- Empty task validation
+- Task counts summary (Total, Completed, Pending)
 
 ## Installation & Running
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Run the application:
-   ```bash
-   streamlit run app.py
-   ```
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Running Tests
-Run pytest on the test suite:
+## Testing
 ```bash
 pytest tests/
 ```

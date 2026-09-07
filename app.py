@@ -627,7 +627,7 @@ def _run_and_render_turn(
         for tool_call in tool_calls:
             render_tool_box(tool_call)
             if tool_call.get("name") == "apply_approved_change":
-                st.session_state.applied_change_ids.append(
+                _note_applied_change(
                     tool_call.get("input", {}).get("change_id", "")
                 )
 
@@ -719,7 +719,7 @@ def _apply_changeset_and_resume(agent, changeset_id: str) -> None:
     # this_session() see this application correctly no matter which of the
     # two ways a file actually got written to disk.
     for entry in applied:
-        st.session_state.applied_change_ids.append(entry["change_id"])
+        _note_applied_change(entry["change_id"])
 
     summary = (
         f"✅ {len(applied)} approved change{'s' if len(applied) != 1 else ''} "
@@ -1000,25 +1000,41 @@ def _render_project_package_section(task: dict | None) -> None:
         )
 
 
+def _note_applied_change(change_id: str) -> None:
+    """Record one change_id as applied to disk - the single source
+    st.session_state.applied_change_ids has always been populated from
+    (whether the write happened via the agent's own apply_approved_change
+    tool call or via this UI's batch "Apply Approved Changes" button; see
+    _run_and_render_turn/_apply_changeset_and_resume) - and, if that change
+    just wrote a file under "generated_projects/<slug>", make that project
+    the explicitly-tracked active one (st.session_state.active_project_path).
+
+    This is the ONLY place active_project_path is written, and it fires at
+    exactly the moment a generated project's file is actually applied -
+    i.e. whenever a new project is generated (its first applied file makes
+    it active) and whenever generation of further files completes. The
+    Project tab (render_project_page) reads active_project_path alone -
+    never by scanning every folder under generated_projects/."""
+    st.session_state.applied_change_ids.append(change_id)
+    change = workflow.get_change(change_id)
+    if change is None or not change.applied:
+        return
+    file_path = change.file_path
+    if not file_path.startswith("generated_projects/"):
+        return
+    parts = file_path.split("/")
+    if len(parts) >= 2:
+        st.session_state.active_project_path = "/".join(parts[:2])
+
+
 def _current_generated_project_root() -> str | None:
-    """The generated_projects/<slug> root this session most recently
-    actually applied a change to, if any - derived only from
-    st.session_state.applied_change_ids (populated at the moment each change
-    is really written to disk, whether via the agent's own
-    apply_approved_change tool call or via this UI's batch "Apply Approved
-    Changes" button - see _run_and_render_turn/_apply_changeset_and_resume)
-    resolved through the real change registry (workflow.get_change), never
-    guessed from chat text."""
-    for change_id in reversed(st.session_state.applied_change_ids):
-        change = workflow.get_change(change_id)
-        if change is None or not change.applied:
-            continue
-        file_path = change.file_path
-        if file_path.startswith("generated_projects/"):
-            parts = file_path.split("/")
-            if len(parts) >= 2:
-                return "/".join(parts[:2])
-    return None
+    """The generated_projects/<slug> root this session currently treats as
+    active, for the packaging/live-preview sections (_render_project_
+    package_section/_render_live_application_section) - the same explicitly
+    tracked st.session_state.active_project_path the Project tab uses (see
+    _note_applied_change), never guessed from chat text or re-derived by
+    scanning every folder under generated_projects/."""
+    return st.session_state.active_project_path
 
 
 def _generated_project_tests_passed(project_root: str) -> bool:
@@ -1154,8 +1170,23 @@ if "git_status_cache" not in st.session_state:
 if "git_branch_cache" not in st.session_state:
     st.session_state.git_branch_cache = None
 
+if "active_project_path" not in st.session_state:
+    # The one, explicitly tracked PROJECT_ROOT-relative path (e.g.
+    # "generated_projects/todo_list") the Project tab shows - set only by
+    # _note_applied_change, the moment a generated project's file is
+    # actually applied to disk. None means no project has been generated
+    # yet this session.
+    st.session_state.active_project_path = None
+
 if "project_tree_cache" not in st.session_state:
     st.session_state.project_tree_cache = None
+
+if "project_tree_cache_root" not in st.session_state:
+    # Which active_project_path project_tree_cache was actually built for -
+    # lets the Project tab notice the active project changed (e.g. a new
+    # project was just generated) and rebuild automatically, without
+    # requiring a manual Refresh click.
+    st.session_state.project_tree_cache_root = None
 
 
 # ---------------------------------------------------------------------------
@@ -1481,27 +1512,50 @@ def render_chat_page() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _load_active_project_tree(project_root: str) -> str:
+    """The active generated project's real tree (tools.get_generated_project_
+    tree, called directly - never through the agent), or a plain error
+    string if it can't be read. Never raises."""
+    try:
+        return tools.get_generated_project_tree(project_root)
+    except Exception as exc:  # noqa: BLE001
+        log_error("get_generated_project_tree_ui", exc)
+        return "⚠️ Could not read the project structure."
+
+
 def render_project_page() -> None:
     st.markdown('<div class="page-title">Project</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="page-subtitle">This project\'s real file tree '
-        "(read-only).</div>",
+        '<div class="page-subtitle">The active generated project\'s real '
+        "file tree (read-only).</div>",
         unsafe_allow_html=True,
     )
-    if st.button("Refresh", key="refresh_project_files"):
-        try:
-            st.session_state.project_tree_cache = tools.list_project_files.invoke({})
-        except Exception as exc:  # noqa: BLE001
-            log_error("list_project_files_ui", exc)
-            st.session_state.project_tree_cache = (
-                "⚠️ Could not read the project structure."
-            )
 
-    cached = st.session_state.get("project_tree_cache")
-    if cached is None:
-        st.caption("Click Refresh to view the project's real file tree.")
+    refresh_clicked = st.button("Refresh", key="refresh_project_files")
+
+    # Renders ONLY st.session_state.active_project_path - the one,
+    # explicitly tracked current/active project (see _note_applied_change) -
+    # never every folder under generated_projects/.
+    active_project = st.session_state.active_project_path
+
+    if not active_project:
+        st.session_state.project_tree_cache = None
+        st.session_state.project_tree_cache_root = None
+        st.caption(
+            "No project selected. Generate or select a project to view its "
+            "structure."
+        )
         return
-    st.code(cached, language=None)
+
+    # Rebuild whenever asked (Refresh) or whenever the active project has
+    # changed since the cached tree was built (e.g. a new project was just
+    # generated) - so switching projects shows the new one immediately,
+    # with no manual Refresh required.
+    if refresh_clicked or st.session_state.project_tree_cache_root != active_project:
+        st.session_state.project_tree_cache = _load_active_project_tree(active_project)
+        st.session_state.project_tree_cache_root = active_project
+
+    st.code(st.session_state.project_tree_cache, language=None)
 
 
 # ---------------------------------------------------------------------------

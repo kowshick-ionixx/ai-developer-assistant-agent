@@ -1625,3 +1625,152 @@ def test_zip_scopes_to_generated_project_when_applied_via_apply_button(
     assert "tools.py" not in package["files"]
     assert "workflow.py" not in package["files"]
     assert "agent.py" not in package["files"]
+
+
+# ---------------------------------------------------------------------------
+# Project tab - shows ONLY the explicitly tracked active generated project
+# (st.session_state.active_project_path), never every folder under
+# generated_projects/. See app.py's _note_applied_change/render_project_page.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_scratch_generated_projects():
+    """Two real, disposable generated projects on disk at once, so tests
+    can prove the Project tab shows only the active one and never both."""
+    import tools
+
+    first_root = tools.PROJECT_ROOT / "generated_projects" / "_apptest_first"
+    second_root = tools.PROJECT_ROOT / "generated_projects" / "_apptest_second"
+    first_root.mkdir(parents=True)
+    second_root.mkdir(parents=True)
+    (first_root / "app.py").write_text("import streamlit as st\n")
+    (second_root / "main.py").write_text("import streamlit as st\n")
+    yield first_root, second_root
+    import shutil
+
+    shutil.rmtree(first_root, ignore_errors=True)
+    shutil.rmtree(second_root, ignore_errors=True)
+
+
+def _approve_and_apply_via_ui(at, change: workflow.ProposedChange):
+    """Drive the real Approve then Apply buttons on the Changes page for one
+    change set - the same real UI path a generated project's files are
+    actually written to disk through (see
+    test_zip_scopes_to_generated_project_when_applied_via_apply_button),
+    never a direct workflow.mark_applied() shortcut - so this exercises the
+    real app.py code (_apply_changeset_and_resume -> _note_applied_change)
+    that sets st.session_state.active_project_path."""
+    at = _goto(at, "Changes")
+    approve_btn = next(
+        b for b in at.button if b.key == f"approve_set_{change.changeset_id}"
+    )
+    approve_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    apply_btn = next(
+        b for b in at.button if b.key == f"apply_set_{change.changeset_id}"
+    )
+    apply_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+    assert workflow.get_change(change.change_id).applied is True
+    return at
+
+
+def test_project_tab_shows_no_project_selected_message_before_any_generation(
+    apptest_with_mocked_agent,
+):
+    at = _goto(apptest_with_mocked_agent, "Project")
+    caption_text = "\n".join(c.value for c in at.caption)
+    assert (
+        "No project selected. Generate or select a project to view its "
+        "structure." in caption_text
+    )
+    code_blocks = [c.value for c in at.code]
+    assert code_blocks == []
+
+
+def test_project_tab_shows_only_the_active_generated_project(
+    apptest_with_mocked_agent, two_scratch_generated_projects
+):
+    at = apptest_with_mocked_agent
+    first_root, _second_root = two_scratch_generated_projects
+
+    change = workflow.register_change(
+        file_path="generated_projects/_apptest_first/app.py",
+        action="create",
+        content="import streamlit as st\n",
+        reason="generated app (test)",
+    )
+    at = _approve_and_apply_via_ui(at, change)
+
+    at = _goto(at, "Project")
+    code_text = "\n".join(c.value for c in at.code)
+    assert "_apptest_first" in code_text
+    assert "app.py" in code_text
+    assert "_apptest_second" not in code_text
+    assert "main.py" not in code_text
+
+
+def test_project_tab_switches_to_the_newly_generated_project(
+    apptest_with_mocked_agent, two_scratch_generated_projects
+):
+    """Generating project A then project B must flip the Project tab from
+    showing only A to showing only B - never both at once."""
+    at = apptest_with_mocked_agent
+    first_root, second_root = two_scratch_generated_projects
+
+    change_a = workflow.register_change(
+        file_path="generated_projects/_apptest_first/app.py",
+        action="create",
+        content="import streamlit as st\n",
+        reason="generated app (test)",
+    )
+    at = _approve_and_apply_via_ui(at, change_a)
+
+    at = _goto(at, "Project")
+    code_text = "\n".join(c.value for c in at.code)
+    assert "_apptest_first" in code_text
+    assert "_apptest_second" not in code_text
+
+    change_b = workflow.register_change(
+        file_path="generated_projects/_apptest_second/main.py",
+        action="create",
+        content="import streamlit as st\n",
+        reason="generated app (test)",
+    )
+    at = _approve_and_apply_via_ui(at, change_b)
+
+    at = _goto(at, "Project")
+    code_text = "\n".join(c.value for c in at.code)
+    assert "_apptest_second" in code_text
+    assert "main.py" in code_text
+    assert "_apptest_first" not in code_text
+    assert "app.py" not in code_text
+
+
+def test_project_tab_refresh_still_scopes_to_the_active_project(
+    apptest_with_mocked_agent, two_scratch_generated_projects
+):
+    at = apptest_with_mocked_agent
+    first_root, _second_root = two_scratch_generated_projects
+
+    change = workflow.register_change(
+        file_path="generated_projects/_apptest_first/app.py",
+        action="create",
+        content="import streamlit as st\n",
+        reason="generated app (test)",
+    )
+    at = _approve_and_apply_via_ui(at, change)
+
+    at = _goto(at, "Project")
+    refresh_btn = next(b for b in at.button if b.key == "refresh_project_files")
+    refresh_btn.click()
+    at.run(timeout=30)
+    assert at.exception == []
+
+    code_text = "\n".join(c.value for c in at.code)
+    assert "_apptest_first" in code_text
+    assert "_apptest_second" not in code_text

@@ -1,1 +1,1 @@
-# Conftest for todo_app test suite
+# Pytest configuration for todo_app

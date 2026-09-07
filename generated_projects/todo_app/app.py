@@ -1,89 +1,63 @@
 import streamlit as st
-
-st.set_page_config(page_title="To-Do List App", page_icon="✅", layout="centered")
-
-def init_state():
-    if "tasks" not in st.session_state:
-        st.session_state.tasks = []
-
-def add_task(title, description=""):
-    if title.strip():
-        st.session_state.tasks.append({
-            "title": title.strip(),
-            "description": description.strip(),
-            "completed": False
-        })
-        return True
-    return False
-
-def toggle_task(index):
-    if 0 <= index < len(st.session_state.tasks):
-        st.session_state.tasks[index]["completed"] = not st.session_state.tasks[index]["completed"]
-
-def delete_task(index):
-    if 0 <= index < len(st.session_state.tasks):
-        st.session_state.tasks.pop(index)
+from database import init_db, add_task, get_tasks, complete_task, delete_task, get_task_counts
 
 def main():
-    init_state()
-    
-    st.title("✅ Python To-Do List App")
-    st.markdown("A simple and clean task management app built with Streamlit.")
+    st.set_page_config(page_title="Simple To-Do List Application", page_icon="📝", layout="centered")
+    init_db()
 
-    # Sidebar for adding tasks
-    st.sidebar.header("Add New Task")
-    with st.sidebar.form("task_form", clear_on_submit=True):
-        title = st.text_input("Task Title")
-        description = st.text_area("Description (optional)")
+    st.title("📝 Simple To-Do List Application")
+
+    # Add task form
+    with st.form("add_task_form", clear_on_submit=True):
+        task_desc = st.text_input("New Task Description")
         submitted = st.form_submit_button("Add Task")
         if submitted:
-            if add_task(title, description):
-                st.sidebar.success(f"Added task: {title}")
-                st.rerun()
+            if not task_desc or not task_desc.strip():
+                st.error("Task description cannot be empty.")
             else:
-                st.sidebar.error("Task title cannot be empty.")
-
-    # Main area - Filter & Tasks
-    filter_option = st.radio("Filter Tasks", ["All", "Active", "Completed"], horizontal=True)
-
-    tasks = st.session_state.tasks
-
-    if filter_option == "Active":
-        filtered_indices = [i for i, t in enumerate(tasks) if not t["completed"]]
-    elif filter_option == "Completed":
-        filtered_indices = [i for i, t in enumerate(tasks) if t["completed"]]
-    else:
-        filtered_indices = list(range(len(tasks)))
-
-    if not filtered_indices:
-        st.info(f"No {filter_option.lower()} tasks found.")
-    else:
-        st.markdown(f"### Tasks ({len(filtered_indices)})")
-        for i in filtered_indices:
-            task = tasks[i]
-            col1, col2, col3 = st.columns([0.1, 0.7, 0.2])
-            with col1:
-                checked = st.checkbox("", value=task["completed"], key=f"chk_{i}")
-                if checked != task["completed"]:
-                    toggle_task(i)
+                try:
+                    add_task(task_desc)
+                    st.success("Task added successfully!")
                     st.rerun()
-            with col2:
-                if task["completed"]:
-                    st.markdown(f"~~**{task['title']}**~~")
-                else:
-                    st.markdown(f"**{task['title']}**")
-                if task["description"]:
-                    st.caption(task["description"])
-            with col3:
-                if st.button("Delete", key=f"del_{i}"):
-                    delete_task(i)
-                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error adding task: {e}")
 
-    # Clear completed button
-    completed_count = sum(1 for t in tasks if t["completed"])
-    if completed_count > 0 and st.button("Clear Completed Tasks"):
-        st.session_state.tasks = [t for t in tasks if not t["completed"]]
-        st.rerun()
+    st.markdown("---")
+
+    # Display counts
+    counts = get_task_counts()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Tasks", counts["total"])
+    col2.metric("Completed", counts["completed"])
+    col3.metric("Pending", counts["pending"])
+
+    st.markdown("---")
+
+    # View tasks
+    st.subheader("Your Tasks")
+    tasks = get_tasks()
+
+    if not tasks:
+        st.info("No tasks yet. Add one above!")
+        return
+
+    for task in tasks:
+        cols = st.columns([0.6, 0.2, 0.2])
+        status_str = "✅" if task["completed"] else "⏳"
+        desc_text = f"~~{task['description']}~~" if task["completed"] else task["description"]
+        
+        cols[0].write(f"{status_str} {desc_text} *({task['created_date']})*")
+        
+        if not task["completed"]:
+            if cols[1].button("Complete", key=f"complete_{task['id']}"):
+                complete_task(task['id'])
+                st.rerun()
+        else:
+            cols[1].write("")
+
+        if cols[2].button("Delete", key=f"delete_{task['id']}"):
+            delete_task(task['id'])
+            st.rerun()
 
 if __name__ == "__main__":
     main()

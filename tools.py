@@ -1038,7 +1038,11 @@ def check_python_syntax(file_path: str = ".") -> str:
 def _build_tree(directory: Path, lines: list[str], prefix: str) -> None:
     try:
         entries = sorted(
-            (p for p in directory.iterdir() if p.name not in _EXCLUDED_DIR_NAMES),
+            (
+                p
+                for p in directory.iterdir()
+                if p.name not in _EXCLUDED_DIR_NAMES and not _is_blocked_file(p)
+            ),
             key=lambda p: (p.is_file(), p.name.lower()),
         )
     except OSError:
@@ -1052,6 +1056,16 @@ def _build_tree(directory: Path, lines: list[str], prefix: str) -> None:
         if entry.is_dir():
             extension = "    " if is_last else "│   "
             _build_tree(entry, lines, prefix + extension)
+
+
+def _directory_tree_text(root: Path) -> str:
+    """Shared tree-rendering used by both list_project_files (the whole
+    assistant project, for the agent) and get_generated_project_tree (one
+    generated project, for the UI's Project tab) - same exclusions
+    (noise folders, secrets/credentials) either way."""
+    lines: list[str] = [f"{root.name}/"]
+    _build_tree(root, lines, prefix="")
+    return "\n".join(lines)
 
 
 @tool
@@ -1068,11 +1082,27 @@ def list_project_files() -> str:
     log_tool_input("(no arguments - lists the entire project tree)")
     log_tool_execution("Walking project directory...")
 
-    lines: list[str] = [f"{PROJECT_ROOT.name}/"]
-    _build_tree(PROJECT_ROOT, lines, prefix="")
-    result = "\n".join(lines)
+    result = _directory_tree_text(PROJECT_ROOT)
     log_tool_result(result)
     return result
+
+
+def get_generated_project_tree(project_root: str) -> str:
+    """Read-only file/folder tree for exactly ONE generated project (e.g.
+    "generated_projects/todo_list"), for the UI's Project tab - called
+    directly from app.py, never through the agent, so the tab can show the
+    active generated project alone instead of every folder under
+    generated_projects/. Reuses _validate_generated_project_dir, the same
+    path-safety/scoping check every other single-generated-project
+    operation (launch/stop, packaging) already shares, and the same
+    noise/secret exclusions as list_project_files. Returns a plain error
+    string (never raises) if `project_root` isn't a real, individually
+    named project folder under 'generated_projects/'.
+    """
+    safe_dir, error = _validate_generated_project_dir(project_root)
+    if safe_dir is None:
+        return f"Error: {error}"
+    return _directory_tree_text(safe_dir)
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from tools import (
     _build_tree,
     calculator,
     explain_python_code,
+    get_generated_project_tree,
     list_project_files,
     read_project_file,
     run_black,
@@ -292,6 +293,54 @@ def test_build_tree_handles_missing_directory_safely():
     lines: list[str] = []
     _build_tree(PROJECT_ROOT / "does_not_exist_dir", lines, prefix="")
     assert lines == []
+
+
+# ---------------------------------------------------------------------------
+# get_generated_project_tree - the Project tab's scoped, single-project tree
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_scratch_projects():
+    """Two real, disposable generated projects on disk at once - proves
+    get_generated_project_tree scopes to exactly one, never both, and never
+    exposes a secret file living alongside real source files."""
+    first = PROJECT_ROOT / "generated_projects" / "_tools_test_first"
+    second = PROJECT_ROOT / "generated_projects" / "_tools_test_second"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "app.py").write_text("import streamlit as st\n")
+    (first / ".env").write_text("SECRET_KEY=abc123\n")
+    (second / "main.py").write_text("import streamlit as st\n")
+    yield first, second
+    import shutil
+
+    shutil.rmtree(first, ignore_errors=True)
+    shutil.rmtree(second, ignore_errors=True)
+
+
+def test_get_generated_project_tree_shows_only_that_project(two_scratch_projects):
+    result = get_generated_project_tree("generated_projects/_tools_test_first")
+    assert "app.py" in result
+    assert "_tools_test_second" not in result
+    assert "main.py" not in result
+
+
+def test_get_generated_project_tree_excludes_secret_files(two_scratch_projects):
+    result = get_generated_project_tree("generated_projects/_tools_test_first")
+    assert ".env" not in result
+
+
+def test_get_generated_project_tree_rejects_the_generated_projects_folder_itself(
+    two_scratch_projects,
+):
+    result = get_generated_project_tree("generated_projects")
+    assert result.startswith("Error:")
+
+
+def test_get_generated_project_tree_rejects_a_nonexistent_project():
+    result = get_generated_project_tree("generated_projects/does_not_exist")
+    assert result.startswith("Error:")
 
 
 # ---------------------------------------------------------------------------
