@@ -1868,17 +1868,21 @@ def render_git_page() -> None:
             st.session_state.git_branch_cache = tools.git_branch.invoke({})
         except Exception as exc:  # noqa: BLE001
             log_error("git_branch_ui", exc)
-            st.session_state.git_branch_cache = "⚠️ Could not read the Git branch."
+            st.session_state.git_branch_cache = (
+                f"⚠️ Could not read the Git branch: {exc}"
+            )
         try:
             st.session_state.git_status_cache = tools.git_status.invoke({})
         except Exception as exc:  # noqa: BLE001
             log_error("git_status_ui", exc)
-            st.session_state.git_status_cache = "⚠️ Could not read the Git status."
+            st.session_state.git_status_cache = (
+                f"⚠️ Could not read the Git status: {exc}"
+            )
         try:
             st.session_state.git_diff_cache = tools.git_diff.invoke({})
         except Exception as exc:  # noqa: BLE001
             log_error("git_diff_ui", exc)
-            st.session_state.git_diff_cache = "⚠️ Could not read the Git diff."
+            st.session_state.git_diff_cache = f"⚠️ Could not read the Git diff: {exc}"
 
     branch_cache = st.session_state.get("git_branch_cache")
     status_cache = st.session_state.get("git_status_cache")

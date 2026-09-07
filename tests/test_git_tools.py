@@ -10,10 +10,10 @@ need a real `git` executable or a real repository on disk.
 import datetime
 
 import pytest
-from git.exc import GitCommandError
 from pydantic import ValidationError
 
-import tools
+import tools  # noqa: I001 - must import before git.exc so git executable discovery runs first
+from git.exc import GitCommandError
 from tools import git_branch, git_diff, git_log, git_status
 
 
@@ -101,7 +101,11 @@ class _FakeRepo:
 
 
 def _use_repo(monkeypatch, repo):
-    monkeypatch.setattr(tools, "_get_repo", lambda: repo)
+    monkeypatch.setattr(tools, "_get_repo", lambda: (repo, None))
+
+
+def _use_error(monkeypatch, message):
+    monkeypatch.setattr(tools, "_get_repo", lambda: (None, message))
 
 
 # ---------------------------------------------------------------------------
@@ -110,25 +114,31 @@ def _use_repo(monkeypatch, repo):
 
 
 def test_git_status_reports_missing_repository(monkeypatch):
-    monkeypatch.setattr(tools, "_get_repo", lambda: None)
+    _use_error(monkeypatch, tools._NOT_A_GIT_REPO_MESSAGE)
     result = git_status.invoke({})
     assert "not" in result.lower()
     assert "git" in result.lower()
 
 
 def test_git_log_reports_missing_repository(monkeypatch):
-    monkeypatch.setattr(tools, "_get_repo", lambda: None)
+    _use_error(monkeypatch, tools._NOT_A_GIT_REPO_MESSAGE)
     assert "git" in git_log.invoke({}).lower()
 
 
 def test_git_diff_reports_missing_repository(monkeypatch):
-    monkeypatch.setattr(tools, "_get_repo", lambda: None)
+    _use_error(monkeypatch, tools._NOT_A_GIT_REPO_MESSAGE)
     assert "git" in git_diff.invoke({}).lower()
 
 
 def test_git_branch_reports_missing_repository(monkeypatch):
-    monkeypatch.setattr(tools, "_get_repo", lambda: None)
+    _use_error(monkeypatch, tools._NOT_A_GIT_REPO_MESSAGE)
     assert "git" in git_branch.invoke({}).lower()
+
+
+def test_git_branch_reports_git_not_installed(monkeypatch):
+    _use_error(monkeypatch, tools._GIT_NOT_INSTALLED_MESSAGE)
+    result = git_branch.invoke({})
+    assert "not be found" in result.lower() or "not installed" in result.lower()
 
 
 # ---------------------------------------------------------------------------

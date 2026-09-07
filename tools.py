@@ -221,6 +221,7 @@ import json
 import operator
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -240,9 +241,42 @@ from pathlib import Path
 # clear per-call error instead; see _get_repo().
 os.environ.setdefault("GIT_PYTHON_REFRESH", "quiet")
 
+
+def _discover_git_executable() -> str | None:
+    """Best-effort discovery of the `git` executable for when it exists on
+    disk but isn't on PATH (common for a per-user Git-for-Windows install).
+    Returns an absolute path to use, or None to leave GitPython's normal
+    PATH-based lookup alone. Never hardcodes a machine-specific path - every
+    candidate is built from standard OS environment variables."""
+    if shutil.which("git"):
+        return None
+
+    env_dirs = [
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    for env_dir in env_dirs:
+        if not env_dir:
+            continue
+        for sub in ("cmd/git.exe", "bin/git.exe"):
+            candidate = Path(env_dir) / "Programs" / "Git" / sub
+            if candidate.is_file():
+                return str(candidate)
+            candidate = Path(env_dir) / "Git" / sub
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+_discovered_git = _discover_git_executable()
+if _discovered_git:
+    os.environ.setdefault("GIT_PYTHON_GIT_EXECUTABLE", _discovered_git)
+
 from git import Repo
 from git.exc import (
     GitCommandError,
+    GitCommandNotFound,
     InvalidGitRepositoryError,
     NoSuchPathError,
 )
@@ -351,8 +385,11 @@ _MAX_GIT_LOG_COMMITS = 20
 _DEFAULT_GIT_LOG_COMMITS = 10
 _MAX_DIFF_CHARS = 6000
 _NOT_A_GIT_REPO_MESSAGE = (
-    "Error: Git is not available for this project (either it is not inside a "
-    "Git repository, or the 'git' executable is not installed on this machine)."
+    "This project is not a Git repository. Run git init to enable Git information."
+)
+_GIT_NOT_INSTALLED_MESSAGE = (
+    "Error: the 'git' executable could not be found (it is either not installed "
+    "or not on PATH), so Git information cannot be read."
 )
 
 # Phase 4: GitHub tools (read-only, least privilege)
@@ -1330,9 +1367,12 @@ def documentation_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _get_repo() -> Repo | None:
-    """Open this project's own Git repository, or None if it isn't one (or
-    if no working `git` executable is available on this machine at all).
+def _get_repo() -> tuple[Repo | None, str | None]:
+    """Open this project's own Git repository, rooted at PROJECT_ROOT.
+
+    Returns `(repo, None)` on success, or `(None, message)` with a specific,
+    user-facing explanation of why Git information isn't available (Git not
+    installed, PROJECT_ROOT isn't a repository, or some other Git failure).
 
     Deliberately does NOT search parent directories, so these tools can
     never reach an unrelated repository elsewhere on disk.
@@ -1340,9 +1380,13 @@ def _get_repo() -> Repo | None:
     try:
         repo = Repo(PROJECT_ROOT, search_parent_directories=False)
         repo.git.version()  # forces a real invocation of the git executable
-        return repo
-    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, OSError):
-        return None
+        return repo, None
+    except GitCommandNotFound:
+        return None, _GIT_NOT_INSTALLED_MESSAGE
+    except (InvalidGitRepositoryError, NoSuchPathError):
+        return None, _NOT_A_GIT_REPO_MESSAGE
+    except (GitCommandError, OSError) as exc:
+        return None, f"Error: could not access Git ({exc})."
 
 
 def _redact_diff_for_blocked_files(diff_text: str) -> str:
@@ -1377,17 +1421,17 @@ def git_status() -> str:
     """
     log_tool_call("git_status")
     log_tool_input("(no arguments - inspects the project's Git working tree)")
-    repo = _get_repo()
+    repo, error = _get_repo()
     if repo is None:
-        log_tool_result(_NOT_A_GIT_REPO_MESSAGE)
-        return _NOT_A_GIT_REPO_MESSAGE
+        log_tool_result(error)
+        return error
 
     log_tool_execution("Checking Git status...")
     try:
         porcelain = repo.git.status("--porcelain")
     except GitCommandError as exc:
         log_error("git_status", exc)
-        result = "Error: could not read Git status."
+        result = f"Error: could not read Git status ({exc})."
         log_tool_result(result)
         return result
 
@@ -1447,10 +1491,10 @@ def git_log(max_count: int = _DEFAULT_GIT_LOG_COMMITS) -> str:
     max_count = max(1, min(max_count, _MAX_GIT_LOG_COMMITS))
     log_tool_input(f"max_count={max_count}")
 
-    repo = _get_repo()
+    repo, error = _get_repo()
     if repo is None:
-        log_tool_result(_NOT_A_GIT_REPO_MESSAGE)
-        return _NOT_A_GIT_REPO_MESSAGE
+        log_tool_result(error)
+        return error
 
     log_tool_execution("Reading Git log...")
     try:
@@ -1497,10 +1541,10 @@ def git_diff(file_path: str = "") -> str:
     file_path = file_path.strip()
     log_tool_input(file_path or "(no file_path - whole working tree)")
 
-    repo = _get_repo()
+    repo, error = _get_repo()
     if repo is None:
-        log_tool_result(_NOT_A_GIT_REPO_MESSAGE)
-        return _NOT_A_GIT_REPO_MESSAGE
+        log_tool_result(error)
+        return error
 
     log_tool_execution("Checking Git changes...")
     args = [file_path] if file_path else []
@@ -1510,7 +1554,7 @@ def git_diff(file_path: str = "") -> str:
             diff_text = repo.git.diff("--cached", *args)
     except GitCommandError as exc:
         log_error("git_diff", exc)
-        result = "Error: could not read Git diff (check that the file path is valid)."
+        result = f"Error: could not read Git diff ({exc})."
         log_tool_result(result)
         return result
 
@@ -1557,10 +1601,10 @@ def git_branch() -> str:
     """
     log_tool_call("git_branch")
     log_tool_input("(no arguments)")
-    repo = _get_repo()
+    repo, error = _get_repo()
     if repo is None:
-        log_tool_result(_NOT_A_GIT_REPO_MESSAGE)
-        return _NOT_A_GIT_REPO_MESSAGE
+        log_tool_result(error)
+        return error
 
     log_tool_execution("Checking Git branches...")
     try:
@@ -1570,7 +1614,7 @@ def git_branch() -> str:
         )
     except (GitCommandError, TypeError, ValueError) as exc:
         log_error("git_branch", exc)
-        result = "Error: could not read Git branch information."
+        result = f"Error: could not read Git branch information ({exc})."
         log_tool_result(result)
         return result
 
