@@ -1,66 +1,57 @@
 import os
 import pytest
 from database import (
-    init_db,
-    add_employee,
-    get_employees,
-    get_employee_by_id,
-    mark_attendance,
-    get_attendance,
-    apply_leave,
-    get_leaves,
-    update_leave_status
+    init_db, add_employee, get_all_employees,
+    mark_attendance, get_attendance, apply_leave,
+    get_leaves, update_leave_status
 )
 
 @pytest.fixture
-def test_db(tmp_path):
-    db_file = tmp_path / "test_hrms.db"
-    db_path = str(db_file)
+def temp_db(tmp_path):
+    db_path = str(tmp_path / "test_hrms.db")
     init_db(db_path)
     return db_path
 
-def test_add_and_get_employee(test_db):
-    success, msg = add_employee("Alice Smith", "alice@example.com", "Engineering", "Developer", "2023-01-01", 75000.0, db_path=test_db)
+def test_add_and_get_employee(temp_db):
+    success, msg = add_employee("Alice Smith", "alice@example.com", "Engineering", "Developer", "2023-01-01", db_path=temp_db)
     assert success is True
     
-    # Duplicate email should fail
-    success_dup, _ = add_employee("Alice Clone", "alice@example.com", "HR", "Manager", "2023-02-01", 80000.0, db_path=test_db)
+    # Duplicate email check
+    success_dup, _ = add_employee("Alice Duplicate", "alice@example.com", "HR", "Manager", "2023-02-01", db_path=temp_db)
     assert success_dup is False
     
-    employees = get_employees(db_path=test_db)
+    employees = get_all_employees(db_path=temp_db)
     assert len(employees) == 1
     assert employees[0]["name"] == "Alice Smith"
-    
-    emp = get_employee_by_id(employees[0]["id"], db_path=test_db)
-    assert emp is not None
-    assert emp["email"] == "alice@example.com"
+    assert employees[0]["email"] == "alice@example.com"
 
-def test_attendance(test_db):
-    add_employee("Bob Jones", "bob@example.com", "Sales", "Rep", "2023-01-01", 50000.0, db_path=test_db)
-    employees = get_employees(db_path=test_db)
+def test_attendance(temp_db):
+    add_employee("Bob Jones", "bob@example.com", "Sales", "Executive", db_path=temp_db)
+    employees = get_all_employees(db_path=temp_db)
     emp_id = employees[0]["id"]
     
-    mark_attendance(emp_id, "2023-10-01", "Present", db_path=test_db)
-    records = get_attendance(db_path=test_db)
-    assert len(records) == 1
-    assert records[0]["status"] == "Present"
+    success, msg = mark_attendance(emp_id, "2023-10-01", "Present", db_path=temp_db)
+    assert success is True
     
-    # Update attendance
-    mark_attendance(emp_id, "2023-10-01", "Late", db_path=test_db)
-    records = get_attendance(db_path=test_db)
-    assert len(records) == 1
-    assert records[0]["status"] == "Late"
+    logs = get_attendance(db_path=temp_db)
+    assert len(logs) == 1
+    assert logs[0]["name"] == "Bob Jones"
+    assert logs[0]["status"] == "Present"
 
-def test_leave_management(test_db):
-    add_employee("Charlie Brown", "charlie@example.com", "Finance", "Analyst", "2023-01-01", 60000.0, db_path=test_db)
-    employees = get_employees(db_path=test_db)
+def test_leave_management(temp_db):
+    add_employee("Charlie Brown", "charlie@example.com", "Marketing", "Designer", db_path=temp_db)
+    employees = get_all_employees(db_path=temp_db)
     emp_id = employees[0]["id"]
     
-    apply_leave(emp_id, "2023-11-01", "2023-11-03", "Vacation", db_path=test_db)
-    leaves = get_leaves(db_path=test_db)
+    success, msg = apply_leave(emp_id, "2023-11-01", "2023-11-05", "Vacation", db_path=temp_db)
+    assert success is True
+    
+    leaves = get_leaves(db_path=temp_db)
     assert len(leaves) == 1
     assert leaves[0]["status"] == "Pending"
     
-    update_leave_status(leaves[0]["id"], "Approved", db_path=test_db)
-    leaves = get_leaves(db_path=test_db)
-    assert leaves[0]["status"] == "Approved"
+    leave_id = leaves[0]["id"]
+    update_leave_status(leave_id, "Approved", db_path=temp_db)
+    
+    updated_leaves = get_leaves(db_path=temp_db)
+    assert updated_leaves[0]["status"] == "Approved"

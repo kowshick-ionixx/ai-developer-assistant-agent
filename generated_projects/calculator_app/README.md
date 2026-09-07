@@ -1,26 +1,26 @@
-# Python Calculator Application
+# Calculator App
 
-A simple calculator built with Python and Streamlit supporting addition, subtraction, multiplication, and division.
+A simple, robust calculator web application built with Python and Streamlit, complete with unit tests.
 
 ## Features
-- Basic arithmetic: Addition, Subtraction, Multiplication, Division.
-- Division by zero error handling.
-- Calculation history log stored in session state.
-- Comprehensive unit tests with pytest.
+- Basic arithmetic (Add, Subtract, Multiply, Divide)
+- Advanced operations (Power, Square Root)
+- Live calculation history
+- Comprehensive pytest test suite
 
-## Installation & Running
+## Installation
 
 1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 2. Run the Streamlit app:
-```bash
-streamlit run app.py
-```
+   ```bash
+   streamlit run app.py
+   ```
 
-3. Run tests:
+## Running Tests
 ```bash
 pytest tests/
 ```

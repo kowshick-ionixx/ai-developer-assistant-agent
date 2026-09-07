@@ -1,176 +1,156 @@
 import streamlit as st
-import datetime
+from datetime import date
 from database import (
-    init_db,
-    add_employee,
-    get_employees,
-    get_employee_by_id,
-    mark_attendance,
-    get_attendance,
-    apply_leave,
-    get_leaves,
-    update_leave_status
+    init_db, add_employee, get_all_employees,
+    mark_attendance, get_attendance, apply_leave,
+    get_leaves, update_leave_status
 )
+
+# Initialize database on startup
+init_db()
 
 st.set_page_config(page_title="Simple HRMS", page_icon="👥", layout="wide")
 
-# Initialize DB
-init_db()
+st.title("👥 Simple Human Resource Management System")
 
-st.sidebar.title("HRMS Menu")
-menu = st.sidebar.selectbox("Navigate", ["Dashboard", "Employee Registration", "Employee List", "Attendance", "Leave Management"])
+# Sidebar navigation
+menu = ["Dashboard", "Employees", "Attendance", "Leave Management"]
+choice = st.sidebar.selectbox("Navigation", menu)
 
-if menu == "Dashboard":
-    st.title("📊 HRMS Dashboard")
-    employees = get_employees()
-    attendance = get_attendance()
-    leaves = get_leaves()
-    
-    total_employees = len(employees)
-    today = str(datetime.date.today())
-    today_attendance = [a for a in attendance if a['date'] == today]
-    present_today = len([a for a in today_attendance if a['status'] == 'Present'])
-    pending_leaves = len([l for l in leaves if l['status'] == 'Pending'])
+employees = get_all_employees()
+
+if choice == "Dashboard":
+    st.header("Dashboard Overview")
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Employees", total_employees)
-    col2.metric("Present Today", present_today)
-    col3.metric("Pending Leaves", pending_leaves)
-    
+    with col1:
+        st.metric("Total Employees", len(employees))
+    with col2:
+        leaves = get_leaves()
+        pending_leaves = sum(1 for l in leaves if l["status"] == "Pending")
+        st.metric("Pending Leave Requests", pending_leaves)
+    with col3:
+        attendance_logs = get_attendance()
+        st.metric("Total Attendance Records", len(attendance_logs))
+        
     st.subheader("Recent Employees")
     if employees:
-        st.dataframe(employees[-5:])
+        st.dataframe(employees[-5:], use_container_width=True)
     else:
         st.info("No employees registered yet.")
 
-elif menu == "Employee Registration":
-    st.title("📝 Employee Registration")
+elif choice == "Employees":
+    st.header("Employee Management")
     
-    with st.form("registration_form"):
-        name = st.text_input("Full Name")
-        email = st.text_input("Email Address")
-        department = st.selectbox("Department", ["Engineering", "HR", "Sales", "Marketing", "Finance"])
-        role = st.text_input("Role / Title")
-        date_of_joining = st.date_input("Date of Joining", datetime.date.today())
-        salary = st.number_input("Salary ($)", min_value=0.0, step=1000.0)
-        
-        submitted = st.form_submit_button("Register Employee")
-        if submitted:
-            if not name.strip() or not email.strip() or not role.strip():
-                st.error("Please fill in all required fields.")
-            else:
-                success, msg = add_employee(name, email, department, role, str(date_of_joining), salary)
-                if success:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-
-elif menu == "Employee List":
-    st.title("📋 Employee Directory & Details")
-    employees = get_employees()
+    tab1, tab2 = st.tabs(["Employee Directory", "Add Employee"])
     
-    if not employees:
-        st.info("No employees found.")
-    else:
-        emp_names = {f"{e['id']}: {e['name']} ({e['email']})": e['id'] for e in employees}
-        selected_option = st.selectbox("Select Employee", list(emp_names.keys()))
-        selected_id = emp_names[selected_option]
-        
-        emp = get_employee_by_id(selected_id)
-        if emp:
-            st.subheader(f"Profile: {emp['name']}")
-            col1, col2 = st.columns(2)
-            col1.write(f"**Email:** {emp['email']}")
-            col1.write(f"**Department:** {emp['department']}")
-            col1.write(f"**Role:** {emp['role']}")
-            col2.write(f"**Date of Joining:** {emp['date_of_joining']}")
-            col2.write(f"**Salary:** ${emp['salary']:,.2f}")
-            
-            st.divider()
-            st.subheader("Attendance History")
-            all_att = get_attendance()
-            emp_att = [a for a in all_att if a['employee_id'] == emp['id']]
-            if emp_att:
-                st.dataframe(emp_att)
-            else:
-                st.info("No attendance records for this employee.")
-                
-            st.subheader("Leave Requests")
-            all_leaves = get_leaves()
-            emp_leaves = [l for l in all_leaves if l['employee_id'] == emp['id']]
-            if emp_leaves:
-                st.dataframe(emp_leaves)
-            else:
-                st.info("No leave requests for this employee.")
-
-elif menu == "Attendance":
-    st.title("⏱️ Attendance Management")
-    employees = get_employees()
-    
-    if not employees:
-        st.warning("Please register employees first.")
-    else:
-        with st.form("attendance_form"):
-            att_date = st.date_input("Date", datetime.date.today())
-            emp_options = {f"{e['id']}: {e['name']}": e['id'] for e in employees}
-            selected_emp = st.selectbox("Employee", list(emp_options.keys()))
-            status = st.selectbox("Status", ["Present", "Absent", "Late"])
-            
-            submitted = st.form_submit_button("Record Attendance")
-            if submitted:
-                emp_id = emp_options[selected_emp]
-                success, msg = mark_attendance(emp_id, str(att_date), status)
-                st.success(msg)
-                
-        st.subheader("All Attendance Records")
-        records = get_attendance()
-        if records:
-            st.dataframe(records)
+    with tab1:
+        st.subheader("All Employees")
+        if employees:
+            st.dataframe(employees, use_container_width=True)
         else:
-            st.info("No records found.")
+            st.info("No employees found.")
+            
+    with tab2:
+        st.subheader("Register New Employee")
+        with st.form("employee_form"):
+            name = st.text_input("Full Name")
+            email = st.text_input("Email Address")
+            department = st.selectbox("Department", ["Engineering", "HR", "Sales", "Marketing", "Finance"])
+            role = st.text_input("Role / Job Title")
+            date_joined = st.date_input("Date Joined", value=date.today())
+            
+            submitted = st.form_submit_button("Add Employee")
+            if submitted:
+                if name and email:
+                    success, msg = add_employee(name, email, department, role, str(date_joined))
+                    if success:
+                        st.success(msg)
+                        employees = get_all_employees() # refresh
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please provide Name and Email.")
 
-elif menu == "Leave Management":
-    st.title("🏖️ Leave Management")
-    employees = get_employees()
+elif choice == "Attendance":
+    st.header("Attendance Tracking")
     
     if not employees:
-        st.warning("Please register employees first.")
+        st.warning("Please add employees before recording attendance.")
     else:
-        tab1, tab2 = st.tabs(["Apply Leave", "Manage Leave Requests"])
+        tab1, tab2 = st.tabs(["Mark Attendance", "Attendance History"])
+        
+        with tab1:
+            with st.form("attendance_form"):
+                emp_dict = {f"{e['name']} ({e['email']})": e['id'] for e in employees}
+                selected_emp_label = st.selectbox("Select Employee", list(emp_dict.keys()))
+                att_date = st.date_input("Date", value=date.today())
+                status = st.selectbox("Status", ["Present", "Absent", "Half-Day", "On Leave"])
+                
+                submitted = st.form_submit_button("Submit Attendance")
+                if submitted:
+                    emp_id = emp_dict[selected_emp_label]
+                    success, msg = mark_attendance(emp_id, str(att_date), status)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                        
+        with tab2:
+            st.subheader("Attendance Logs")
+            logs = get_attendance()
+            if logs:
+                st.dataframe(logs, use_container_width=True)
+            else:
+                st.info("No attendance records found.")
+
+elif choice == "Leave Management":
+    st.header("Leave Management")
+    
+    if not employees:
+        st.warning("Please add employees before applying for leave.")
+    else:
+        tab1, tab2 = st.tabs(["Apply for Leave", "Manage Leave Requests"])
         
         with tab1:
             with st.form("leave_form"):
-                emp_options = {f"{e['id']}: {e['name']}": e['id'] for e in employees}
-                selected_emp = st.selectbox("Employee", list(emp_options.keys()))
-                start_date = st.date_input("Start Date", datetime.date.today())
-                end_date = st.date_input("End Date", datetime.date.today())
+                emp_dict = {f"{e['name']} ({e['email']})": e['id'] for e in employees}
+                selected_emp_label = st.selectbox("Select Employee", list(emp_dict.keys()))
+                start_date = st.date_input("Start Date", value=date.today())
+                end_date = st.date_input("End Date", value=date.today())
                 reason = st.text_area("Reason for Leave")
                 
-                submitted = st.form_submit_button("Submit Leave Application")
+                submitted = st.form_submit_button("Submit Leave Request")
                 if submitted:
-                    if end_date < start_date:
-                        st.error("End date cannot be earlier than start date.")
-                    elif not reason.strip():
-                        st.error("Please provide a reason.")
+                    if reason:
+                        emp_id = emp_dict[selected_emp_label]
+                        success, msg = apply_leave(emp_id, str(start_date), str(end_date), reason)
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
                     else:
-                        emp_id = emp_options[selected_emp]
-                        apply_leave(emp_id, str(start_date), str(end_date), reason)
-                        st.success("Leave application submitted successfully.")
+                        st.warning("Please provide a reason for leave.")
                         
         with tab2:
+            st.subheader("Leave Requests")
             leaves = get_leaves()
-            if not leaves:
-                st.info("No leave requests found.")
-            else:
+            if leaves:
                 for leave in leaves:
-                    with st.expander(f"Leave #{leave['id']} - {leave['name']} ({leave['start_date']} to {leave['end_date']}) - Status: {leave['status']}"):
-                        st.write(f"**Reason:** {leave['reason']}")
-                        col1, col2 = st.columns(2)
-                        if col1.button(f"Approve #{leave['id']}", key=f"app_{leave['id']}"):
-                            update_leave_status(leave['id'], "Approved")
-                            st.success("Approved!")
-                            st.rerun()
-                        if col2.button(f"Reject #{leave['id']}", key=f"rej_{leave['id']}"):
-                            update_leave_status(leave['id'], "Rejected")
-                            st.warning("Rejected!")
-                            st.rerun()
+                    with st.container():
+                        cols = st.columns([3, 2, 2, 2])
+                        cols[0].write(f"**{leave['name']}**\n\n{leave['reason']}")
+                        cols[1].write(f"{leave['start_date']} to {leave['end_date']}")
+                        cols[2].write(f"Status: **{leave['status']}**")
+                        
+                        if leave['status'] == 'Pending':
+                            subcols = cols[3].columns(2)
+                            if subcols[0].button("Approve", key=f"app_{leave['id']}"):
+                                update_leave_status(leave['id'], "Approved")
+                                st.rerun()
+                            if subcols[1].button("Reject", key=f"rej_{leave['id']}"):
+                                update_leave_status(leave['id'], "Rejected")
+                                st.rerun()
+                        st.divider()
+            else:
+                st.info("No leave requests found.")

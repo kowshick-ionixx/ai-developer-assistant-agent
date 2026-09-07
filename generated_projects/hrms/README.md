@@ -1,25 +1,27 @@
-# Simple HRMS Application
+# Simple HRMS (Human Resource Management System)
 
-A lightweight Human Resource Management System built with Python, Streamlit, and SQLite.
+A lightweight HRMS built with Python and Streamlit, utilizing SQLite for data storage.
 
 ## Features
-- **Employee Registration**: Register new employees with validation (name, email, department, role, date of joining, salary).
-- **Employee List & Details**: View all employees and inspect individual profiles, including attendance history and leave requests.
-- **Attendance Tracking**: Record and view daily attendance (Present, Absent, Late).
-- **Leave Management**: Submit leave requests and update their status (Pending, Approved, Rejected).
-- **Dashboard**: Summary metrics for total employees, attendance rate, and pending leaves.
+- **Employee Directory:** Add and view employee profiles and departments.
+- **Attendance Tracking:** Record and monitor daily attendance status.
+- **Leave Management:** Submit and approve/reject leave requests.
+- **Dashboard:** Real-time summary metrics.
 
 ## Installation & Running
+
 1. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
+
 2. Run the Streamlit app:
    ```bash
    streamlit run app.py
    ```
 
 ## Running Tests
+Run pytest to verify functionality:
 ```bash
 pytest tests/
 ```

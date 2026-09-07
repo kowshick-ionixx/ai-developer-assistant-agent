@@ -1,23 +1,23 @@
-"""Core calculator logic supporting addition, subtraction, multiplication, and division."""
-
+import math
 
 def add(a: float, b: float) -> float:
-    """Add two numbers."""
     return a + b
 
-
 def subtract(a: float, b: float) -> float:
-    """Subtract b from a."""
     return a - b
 
-
 def multiply(a: float, b: float) -> float:
-    """Multiply two numbers."""
     return a * b
 
-
 def divide(a: float, b: float) -> float:
-    """Divide a by b. Raises ValueError on division by zero."""
     if b == 0:
-        raise ValueError("Cannot divide by zero.")
+        raise ValueError("Division by zero is not allowed.")
     return a / b
+
+def power(a: float, b: float) -> float:
+    return a ** b
+
+def square_root(a: float) -> float:
+    if a < 0:
+        raise ValueError("Square root of negative number is not supported.")
+    return math.sqrt(a)
