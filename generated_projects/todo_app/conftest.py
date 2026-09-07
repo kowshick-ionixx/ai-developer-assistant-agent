@@ -1,1 +1,1 @@
-# Pytest configuration for todo_app
+# pytest configuration for todo_app

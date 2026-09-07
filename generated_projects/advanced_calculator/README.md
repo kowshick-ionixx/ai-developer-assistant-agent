@@ -1,26 +1,24 @@
 # Advanced Calculator
 
-A complete, modern, professional Advanced Calculator application built using Python and Streamlit.
+A feature-rich calculator web application built with Streamlit and Python.
 
 ## Features
-- **Basic Calculator**: Addition, subtraction, multiplication, division, modulus, exponentiation, square root, percentage, factorial, reciprocal, absolute value, sign change, decimal calculations, parentheses and operator precedence.
-- **Scientific Calculator**: sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, log10, natural log (ln), e^x, 10^x, x², x³, xʸ, π, e, and Degrees/Radians mode.
-- **Advanced Functions**: Combinations (nCr), Permutations (nPr), GCD, LCM, Floor, Ceiling, Scientific notation, Memory functions (MC, MR, M+, M-, MS), Calculation history, and Copy result.
-- **Safety & Validation**: Safe mathematical parsing (no unsafe eval), robust error handling for division by zero, invalid inputs, negative square roots, negative factorials, invalid logarithms, and bad expressions.
+- **Basic Arithmetic**: Addition, subtraction, multiplication, division, and exponentiation.
+- **Scientific Functions**: Square root, factorial, sine, cosine, and tangent.
+- **Unit Converters**: Temperature (Celsius, Fahrenheit, Kelvin) and Length (Meters, Kilometers, Centimeters, Millimeters, Miles, Feet, Inches).
+- **History Tracking**: Keeps track of recent calculations within your session.
 
 ## Installation & Running
-
 1. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-
-2. Run the Streamlit application:
+2. Run the application:
    ```bash
    streamlit run app.py
    ```
 
-3. Run tests:
-   ```bash
-   pytest tests/
-   ```
+## Running Tests
+```bash
+pytest tests/
+```

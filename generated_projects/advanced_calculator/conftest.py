@@ -1,7 +1,5 @@
-"""Pytest configuration for advanced_calculator."""
 import sys
 import os
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
+# Add the generated project root to sys.path so tests can import calculator.py
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))

@@ -1,22 +1,18 @@
-# Simple To-Do List Application
+# Simple Todo App
 
-A simple To-Do List application built with Python, Streamlit, and SQLite, adhering to test requirements.
+A simple Python Streamlit application for managing tasks with SQLite backend.
 
-## Features
-- Add new tasks
-- View all tasks with status and creation date
-- Mark tasks as completed
-- Delete tasks
-- Empty task validation
-- Task counts summary (Total, Completed, Pending)
+## Requirements
+- Python 3.8+
+- Streamlit
+- Pytest
 
-## Installation & Running
+## How to Run
 ```bash
-pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Testing
+## How to Test
 ```bash
 pytest tests/
 ```

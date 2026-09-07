@@ -1,63 +1,90 @@
+import sqlite3
 import streamlit as st
-from database import init_db, add_task, get_tasks, complete_task, delete_task, get_task_counts
+
+DB_FILE = "todos.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, completed INTEGER DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_todos():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, task, completed FROM todos")
+    todos = c.fetchall()
+    conn.close()
+    return todos
+
+
+def add_todo(task):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO todos (task, completed) VALUES (?, 0)", (task,))
+    conn.commit()
+    conn.close()
+
+
+def toggle_todo(todo_id, completed):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE todos SET completed = ? WHERE id = ?", (1 if completed else 0, todo_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_todo(todo_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+    conn.commit()
+    conn.close()
+
 
 def main():
-    st.set_page_config(page_title="Simple To-Do List Application", page_icon="📝", layout="centered")
+    st.title("Simple Todo App")
     init_db()
 
-    st.title("📝 Simple To-Do List Application")
-
-    # Add task form
-    with st.form("add_task_form", clear_on_submit=True):
-        task_desc = st.text_input("New Task Description")
-        submitted = st.form_submit_button("Add Task")
-        if submitted:
-            if not task_desc or not task_desc.strip():
-                st.error("Task description cannot be empty.")
-            else:
-                try:
-                    add_task(task_desc)
-                    st.success("Task added successfully!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error adding task: {e}")
-
-    st.markdown("---")
-
-    # Display counts
-    counts = get_task_counts()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Tasks", counts["total"])
-    col2.metric("Completed", counts["completed"])
-    col3.metric("Pending", counts["pending"])
-
-    st.markdown("---")
-
-    # View tasks
-    st.subheader("Your Tasks")
-    tasks = get_tasks()
-
-    if not tasks:
-        st.info("No tasks yet. Add one above!")
-        return
-
-    for task in tasks:
-        cols = st.columns([0.6, 0.2, 0.2])
-        status_str = "✅" if task["completed"] else "⏳"
-        desc_text = f"~~{task['description']}~~" if task["completed"] else task["description"]
-        
-        cols[0].write(f"{status_str} {desc_text} *({task['created_date']})*")
-        
-        if not task["completed"]:
-            if cols[1].button("Complete", key=f"complete_{task['id']}"):
-                complete_task(task['id'])
-                st.rerun()
-        else:
-            cols[1].write("")
-
-        if cols[2].button("Delete", key=f"delete_{task['id']}"):
-            delete_task(task['id'])
+    new_task = st.text_input("Add a new task")
+    if st.button("Add"):
+        if new_task.strip():
+            add_todo(new_task.strip())
+            st.success(f"Added task: {new_task}")
             st.rerun()
+        else:
+            st.warning("Task cannot be empty.")
+
+    st.subheader("Your Tasks")
+    todos = get_todos()
+    if not todos:
+        st.info("No tasks yet. Add one above!")
+    for todo_id, task, completed in todos:
+        col1, col2, col3 = st.columns([0.1, 0.7, 0.2])
+        with col1:
+            is_checked = st.checkbox(
+                "", value=bool(completed), key=f"check_{todo_id}"
+            )
+            if is_checked != bool(completed):
+                toggle_todo(todo_id, is_checked)
+                st.rerun()
+        with col2:
+            if completed:
+                st.markdown(f"~~{task}~~")
+            else:
+                st.write(task)
+        with col3:
+            if st.button("Delete", key=f"del_{todo_id}"):
+                delete_todo(todo_id)
+                st.rerun()
+
 
 if __name__ == "__main__":
     main()
