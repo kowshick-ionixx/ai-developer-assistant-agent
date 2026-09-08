@@ -23,3 +23,12 @@ def slugify(text: str) -> str:
     text = re.sub(r"-+", "-", text)
     # Strip leading/trailing hyphens
     return text.strip("-")
+
+
+def is_palindrome(text: str) -> bool:
+    """Check if a given string (or number converted to string) is a palindrome.
+
+    Ignores case, spaces, and punctuation.
+    """
+    cleaned = "".join(char.lower() for char in str(text) if char.isalnum())
+    return cleaned == cleaned[::-1]
